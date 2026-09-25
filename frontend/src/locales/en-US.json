@@ -32,7 +32,7 @@
   "overview_module_id": "Module id",
   "overview_namespace": "i18n namespace",
   "overview_version": "Module version",
-  "overview_loaded_modules": "Loaded modules",
+  "overview_note_count": "Notes",
   "overview_intents": "Declared intents",
   "overview_intents_empty": "No intents are declared right now.",
   "overview_unknown": "Unknown",

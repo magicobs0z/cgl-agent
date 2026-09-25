@@ -59,7 +59,7 @@ jobs:
         include:
           - platform: windows-x86_64
             os: windows-latest
-            backend_glob: target/release/copper_module_demo.dll
+            backend_glob: src-tauri/target/release/copper_module_demo.dll
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:

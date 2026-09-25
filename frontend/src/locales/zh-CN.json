@@ -32,7 +32,7 @@
   "overview_module_id": "模块 id",
   "overview_namespace": "i18n 命名空间",
   "overview_version": "模块版本",
-  "overview_loaded_modules": "已装载模块数",
+  "overview_note_count": "笔记总数",
   "overview_intents": "已声明意图",
   "overview_intents_empty": "当前没有已声明的意图。",
   "overview_unknown": "未知",

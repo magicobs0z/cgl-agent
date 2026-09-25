@@ -1,19 +1,28 @@
-//! 模块命令的类型化契约层（不依赖 tauri）。
+//! 模块命令：参数形状与分发（不含业务规则，规则在 [`crate::service`]）。
 //!
-//! 为什么不做成 `#[tauri::command]`：模板**不注册命令到内核的 `generate_handler!`**
-//! （那是内核静态列表，模块侧无法扩展，见设计文档 2.2 / 2.7.7 与 4.4 的缺口说明）。
-//! 若在此引入 tauri，本 crate 就得多一份与内核完全一致的 tauri 依赖与特性集，
-//! 编译成本与版本漂移风险都不值得。因此把命令定义成「枚举 + 分发函数」：
-//! 阶段二内核支持附加模块命令注册后，只需在此枚举上套一层命令宏，前端契约不变。
+//! # 命令名与前端 `api.ts` 逐字一致
 //!
-//! **命令名与前端 `api.ts` 的字符串逐字一致**，改动必须两侧同步。
+//! `demo_tools_*` 这组名字是**冻结契约**，迁移不改变它们：前端调用路径是
+//! `kernel 的 module_invoke(module_id, command, args)`，内核把命令原样转给插件，
+//! 因此插件收到的 `operation` 就是这里的命令名。
+//!
+//! # 响应信封
+//!
+//! 插件 ABI 的 `invoke` 只有状态码，**没有结构化错误通道**（返回非 OK 时宿主只能报
+//! "调用失败"，细节丢失）。所以命令结果统一包一层信封：
+//!
+//! - 成功：`{ "ok": true, "data": <命令结果> }`
+//! - 失败：`{ "ok": false, "error": { "kind", "message" } }`
+//!
+//! 前端的 `api.ts` 负责拆信封（把 `ok:false` 还原成可读错误），否则"标题不能为空"
+//! 这类正常校验失败会退化成不可读的后端错误。
 
-use copper_core_lib::error::KernelError;
-use copper_core_lib::state::KernelContext;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::error::ModuleError;
 use crate::service;
+use crate::state::PluginState;
 use crate::storage::{Note, NoteQuery, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT};
 
 /// 命令名：模块概览。
@@ -31,7 +40,7 @@ pub const CMD_EXPOSE_VERSION: &str = "demo_tools_expose_version";
 /// 命令名：最近事件。
 pub const CMD_ACTIVITY_RECENT: &str = "demo_tools_activity_recent";
 
-/// 全部命令名（前端契约自检与调试入口使用）。
+/// 全部命令名（前端契约自检用）。
 pub const ALL_COMMANDS: &[&str] = &[
     CMD_OVERVIEW,
     CMD_NOTES_LIST,
@@ -109,62 +118,50 @@ pub enum DemoCommand {
 }
 
 impl DemoCommand {
-    /// 命令名（与前端 `api.ts` 逐字一致）。
-    pub fn name(&self) -> &'static str {
-        match self {
-            DemoCommand::Overview => CMD_OVERVIEW,
-            DemoCommand::NotesList(_) => CMD_NOTES_LIST,
-            DemoCommand::NoteUpsert(_) => CMD_NOTE_UPSERT,
-            DemoCommand::NoteDelete(_) => CMD_NOTE_DELETE,
-            DemoCommand::Ping(_) => CMD_PING,
-            DemoCommand::ExposeVersion(_) => CMD_EXPOSE_VERSION,
-            DemoCommand::ActivityRecent(_) => CMD_ACTIVITY_RECENT,
-        }
-    }
-
     /// 按命令名与参数 JSON 构造命令（模拟前端 `call(cmd, args)` 的入参链路）。
     ///
-    /// 参数解析失败返回 [`KernelError::InvalidArgument`] 而不是 serde 错误：
+    /// 参数解析失败返回 [`ModuleError::InvalidArgument`] 而不是 serde 错误：
     /// 命令层对前端的失败语义统一为「参数不合法」，便于前端分类提示。
-    pub fn parse(name: &str, args: Value) -> Result<DemoCommand, KernelError> {
+    pub fn parse(name: &str, args: Value) -> Result<Self, ModuleError> {
         // 前端可能传 null 或省略参数：统一归一化为空对象，避免各分支重复处理。
         let args = if args.is_null() { json!({}) } else { args };
         match name {
-            CMD_OVERVIEW => Ok(DemoCommand::Overview),
-            CMD_NOTES_LIST => Ok(DemoCommand::NotesList(parse_args::<NotesListArgs>(name, args)?)),
-            CMD_NOTE_UPSERT => Ok(DemoCommand::NoteUpsert(parse_args::<NoteUpsertArgs>(name, args)?)),
-            CMD_NOTE_DELETE => Ok(DemoCommand::NoteDelete(parse_args::<NoteDeleteArgs>(name, args)?)),
-            CMD_PING => Ok(DemoCommand::Ping(parse_args::<IntentArgs>(name, args)?)),
-            CMD_EXPOSE_VERSION => Ok(DemoCommand::ExposeVersion(parse_args::<IntentArgs>(name, args)?)),
-            CMD_ACTIVITY_RECENT => {
-                Ok(DemoCommand::ActivityRecent(parse_args::<ActivityArgs>(name, args)?))
-            }
-            other => Err(KernelError::InvalidArgument(format!(
-                "未知模块命令 `{other}`；本模块支持: {}",
-                ALL_COMMANDS.join(" / ")
-            ))),
+            CMD_OVERVIEW => Ok(Self::Overview),
+            CMD_NOTES_LIST => Ok(Self::NotesList(parse_args(name, args)?)),
+            CMD_NOTE_UPSERT => Ok(Self::NoteUpsert(parse_args(name, args)?)),
+            CMD_NOTE_DELETE => Ok(Self::NoteDelete(parse_args(name, args)?)),
+            CMD_PING => Ok(Self::Ping(parse_args(name, args)?)),
+            CMD_EXPOSE_VERSION => Ok(Self::ExposeVersion(parse_args(name, args)?)),
+            CMD_ACTIVITY_RECENT => Ok(Self::ActivityRecent(parse_args(name, args)?)),
+            other => Err(ModuleError::UnknownCommand {
+                command: other.to_owned(),
+                supported: ALL_COMMANDS.join(" / "),
+            }),
         }
     }
 }
 
 /// 依目标类型解析 JSON 参数。
 ///
-/// 独立成**泛型函数**而非闭包：闭包无法带泛型参数，其返回类型 `Result<_, KernelError>`
+/// 独立成**泛型函数**而非闭包：闭包无法带泛型参数，其返回类型 `Result<_, ModuleError>`
 /// 只能锚定到第一个调用点，后续分支复用同一闭包就会报 `?` 类型不兼容（E0308）。
-fn parse_args<T: serde::de::DeserializeOwned>(name: &str, args: Value) -> Result<T, KernelError> {
-    serde_json::from_value(args).map_err(|e| {
-        KernelError::InvalidArgument(format!("命令 `{name}` 参数不合法: {e}"))
-    })
+fn parse_args<T: serde::de::DeserializeOwned>(name: &str, args: Value) -> Result<T, ModuleError> {
+    serde_json::from_value(args)
+        .map_err(|e| ModuleError::InvalidArgument(format!("命令 `{name}` 参数不合法: {e}")))
 }
 
 /// 分发命令：参数校验 + 调 service，返回可直接序列化给前端的 JSON。
 ///
-/// 返回 `Result<Value, KernelError>` 而非 `CommandResult`：`CommandError` 的转换由
-/// 命令框架层（内核）负责，模块侧只产出内核错误，避免模块依赖命令框架的错误类型。
-pub fn dispatch(kernel: &KernelContext, cmd: DemoCommand) -> Result<Value, KernelError> {
+/// 未 `start` 时一律拒绝：命令属于运行期能力，宿主在 `stop` 之后仍可能收到前端的
+/// 迟到调用（界面未刷新、点击已排队），此时如实报"模块尚未启动"比返回陈旧数据好。
+pub fn dispatch(state: &mut PluginState, cmd: DemoCommand) -> Result<Value, ModuleError> {
+    if !state.started() {
+        return Err(ModuleError::NotStarted);
+    }
+
     match cmd {
         DemoCommand::Overview => {
-            let overview = service::overview(kernel)?;
+            let overview = service::overview(state.host(), state.activity().len(), true)?;
             to_value(overview)
         }
         DemoCommand::NotesList(args) => {
@@ -176,8 +173,8 @@ pub fn dispatch(kernel: &KernelContext, cmd: DemoCommand) -> Result<Value, Kerne
                 offset: args.offset,
             };
             let offset = query.offset.unwrap_or(0);
-            let notes: Vec<Note> = service::list_notes(kernel, &query)?;
-            let total = crate::storage::note_count(kernel)?;
+            let notes: Vec<Note> = service::list_notes(state.host(), &query)?;
+            let total = crate::storage::note_count(state.host())?;
             to_value(json!({
                 "notes": notes,
                 "total": total,
@@ -186,26 +183,62 @@ pub fn dispatch(kernel: &KernelContext, cmd: DemoCommand) -> Result<Value, Kerne
             }))
         }
         DemoCommand::NoteUpsert(args) => {
-            let note = service::upsert_note(kernel, args.id, &args.title, &args.body, args.pinned)?;
+            let note = service::upsert_note(
+                state.host(),
+                args.id,
+                &args.title,
+                &args.body,
+                args.pinned,
+            )?;
+            state.record_activity(
+                "note.upsert",
+                format!(
+                    "{}笔记 #{}：{}",
+                    if args.id.is_some() { "更新" } else { "新增" },
+                    note.id,
+                    note.title
+                ),
+            );
             to_value(note)
         }
         DemoCommand::NoteDelete(args) => {
-            let deleted = service::delete_note(kernel, args.id)?;
+            let deleted = service::delete_note(state.host(), args.id)?;
+            state.record_activity(
+                "note.delete",
+                format!(
+                    "{}笔记 #{}",
+                    if deleted { "已删除" } else { "未找到" },
+                    args.id
+                ),
+            );
             to_value(json!({ "deleted": deleted, "id": args.id }))
         }
-        DemoCommand::Ping(args) => service::ping(kernel, args.payload),
-        DemoCommand::ExposeVersion(args) => service::expose_version(kernel, args.payload),
+        DemoCommand::Ping(args) => {
+            let result = service::ping(state.host(), args.payload)?;
+            state.record_activity("module.ping", "已发起意图 demo-tools.ping 并收到响应");
+            Ok(result)
+        }
+        DemoCommand::ExposeVersion(args) => service::expose_version(state.host(), args.payload),
         DemoCommand::ActivityRecent(args) => {
-            let limit = service::normalize_limit(args.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT) as usize;
-            let records = service::recent_activity_limited(kernel, limit);
+            let limit =
+                service::normalize_limit(args.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT) as usize;
+            let records = service::recent_activity_limited(state.activity(), limit);
             to_value(json!({ "records": records, "limit": limit }))
         }
     }
 }
 
 /// service 层返回结构必须是可序列化的：失败时如实报错，不返回空对象掩盖问题。
-fn to_value<T: Serialize>(value: T) -> Result<Value, KernelError> {
-    serde_json::to_value(value).map_err(KernelError::from)
+fn to_value<T: Serialize>(value: T) -> Result<Value, ModuleError> {
+    Ok(serde_json::to_value(value)?)
+}
+
+/// 把命令结果包成响应信封（见文件头说明）。
+pub fn envelope(result: Result<Value, ModuleError>) -> Value {
+    match result {
+        Ok(data) => json!({ "ok": true, "data": data }),
+        Err(error) => json!({ "ok": false, "error": error.to_payload() }),
+    }
 }
 
 #[cfg(test)]
@@ -239,8 +272,9 @@ mod tests {
 
     #[test]
     fn parse_rejects_unknown_command_with_readable_hint() {
-        let err = DemoCommand::parse("demo_tools_nope", json!({})).unwrap_err();
-        let text = err.friendly();
+        let error = DemoCommand::parse("demo_tools_nope", json!({})).unwrap_err();
+        assert_eq!(error.kind(), "unknown_command");
+        let text = error.friendly();
         assert!(text.contains("demo_tools_nope"), "{text}");
         assert!(text.contains(CMD_OVERVIEW), "应列出可用命令: {text}");
     }
@@ -248,8 +282,8 @@ mod tests {
     #[test]
     fn parse_reports_missing_required_field() {
         // NoteUpsertArgs.title 是必需字段：缺失应报「参数不合法」而不是 panic。
-        let err = DemoCommand::parse(CMD_NOTE_UPSERT, json!({"body":"x"})).unwrap_err();
-        assert!(err.friendly().contains("参数不合法"), "{}", err.friendly());
+        let error = DemoCommand::parse(CMD_NOTE_UPSERT, json!({"body":"x"})).unwrap_err();
+        assert_eq!(error.kind(), "invalid_argument");
     }
 
     #[test]
@@ -271,8 +305,24 @@ mod tests {
     }
 
     #[test]
-    fn command_name_returns_contract_string() {
-        let cmd = DemoCommand::NoteDelete(NoteDeleteArgs { id: 1 });
-        assert_eq!(cmd.name(), CMD_NOTE_DELETE);
+    fn envelope_separates_success_from_failure() {
+        let ok = envelope(Ok(json!({ "n": 1 })));
+        assert_eq!(ok["ok"], json!(true));
+        assert_eq!(ok["data"]["n"], json!(1));
+
+        let failed = envelope(Err(ModuleError::InvalidArgument("标题不能为空".into())));
+        assert_eq!(failed["ok"], json!(false));
+        assert_eq!(failed["error"]["kind"], json!("invalid_argument"));
+        // 文案带错误类型前缀（`参数不合法: ...`），断言关键内容即可，避免把前缀也钉死。
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("标题不能为空"),
+            "got: {}",
+            failed["error"]["message"]
+        );
+        // 失败信封里不得混入 data，避免前端把错误当成功读。
+        assert!(failed.get("data").is_none());
     }
 }

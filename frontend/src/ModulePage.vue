@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 模块主列表页：概览 / 笔记增删 / 探活 / 意图 / 最近活动。
 //
 // 页面职责：只做展示与用户意图转发；数据与事件订阅由 `useModuleState` 单例承载，
@@ -64,8 +64,8 @@ const overviewFields = computed(() => {
     { key: "overview_namespace", value: o?.i18nNamespace ?? MODULE_I18N_NAMESPACE },
     { key: "overview_version", value: o?.version ?? unknown },
     {
-      key: "overview_loaded_modules",
-      value: o ? String(o.loadedModules) : unknown,
+      key: "overview_note_count",
+      value: o ? String(o.noteCount) : unknown,
     },
   ];
 });

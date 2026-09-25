@@ -7,7 +7,7 @@
 // - schema 必填字段齐备、枚举取值合法；
 // - id 两段式、i18n_namespace 单段且不等同 id；
 // - 后端 crate 名与产物名自洽；
-// - 权限为权威 9 项枚举，默认空；
+// - 权限取值在权威 9 项枚举内（示例模块声明 intents:request 以演示意图发起）；
 // - 语言包扁平键且 zh-CN / en-US 键集完全一致。
 
 import assert from "node:assert/strict";
@@ -60,8 +60,8 @@ test("平台枚举取权威值", () => {
   }
 });
 
-test("权限默认空数组且取值在权威枚举内", () => {
-  assert.deepEqual(manifest.permissions, [], "模板默认不得申请任何权限");
+test("权限取值在权威枚举内（示例模块为演示意图发起声明 intents:request）", () => {
+  assert.ok(Array.isArray(manifest.permissions), "permissions 必须是数组");
   for (const p of manifest.permissions) {
     assert.ok(PERMISSIONS.includes(p), `未知权限 ${p}`);
   }

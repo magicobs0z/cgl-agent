@@ -692,7 +692,7 @@ fn check_logic_close(root: &PNode, crate_name: &str, version: &str) {
         let file = locales_dir.join(format!("{locale}.json"));
         if !file.is_file() {
             panic!(
-                "模块语言包缺失: {}（`src/module.rs` 用 include_str! 引用它，属于冻结契约）",
+                "模块语言包缺失: {}（`src/contract.rs` 与前端共享同一份文案来源，属于冻结契约）",
                 file.display()
             );
         }

@@ -1,163 +1,296 @@
-//! 铜傀儡模块模板 · 示例模块后端（`copper-lamp.demo-tools`）。
+//! 铜傀儡模块模板 · 示例模块后端插件（`copper-lamp.demo-tools`）。
 //!
-//! 本 crate 是**独立 crate**，不是 `CopperCore` 的 workspace 成员：内核仓库未声明
-//! `[workspace]`，本目录也不声明，二者经 `path` 依赖单向引用（设计文档 2.9 阶段一）。
+//! # 运行形态
 //!
-//! ## 阶段一接入方式（当前可行）
+//! 本 crate 编译为 **cdylib**，由内核的 helper 进程（`copper-module-helper`）用
+//! `libloading` 加载进**独立进程**，经版本化插件 ABI 与内核对话。因此这里：
 //!
-//! 本模板**不注册命令到内核的静态命令表**——`tauri::generate_handler!` 是内核源码里的
-//! 固定列表，模块侧无法扩展（设计文档 2.2 / 2.7.7 与 4.4 的缺口说明）。因此在阶段一：
+//! - **不链接内核 crate**：拿不到 `KernelContext`、数据库、事件总线对象；
+//!   一切宿主能力经 [`host::HostClient`] 走能力通道（`storage.*` / `events.publish` /
+//!   `intent.request` / `module.info`）；
+//! - **不使用线程**：helper 主循环一次只处理一帧消息，插件回调串行发生在同一线程
+//!   （见 [`state`] 的线程模型说明），状态用 `&mut` 独占即可；
+//! - **不直接读写文件**：需要持久化就用 `storage.*`，需要用宿主能力就发能力请求。
 //!
-//! 1. 在 `CopperCore/src-tauri/Cargo.toml` 增加依赖：
-//!    `copper-module-demo = { path = "../../CopperModles/src-tauri" }`
-//! 2. 在 `CopperCore/src-tauri/src/lib.rs` 的 `setup` 中、`pool.boot(&kernel)` 之前调用：
+//! # 三个方向的"命令"
 //!
-//!    ```ignore
-//!    copper_module_demo::register(kernel.modules())?;
-//!    ```
+//! helper 通过同一入口 `invoke` 把三件事都送达本插件，靠**保留前缀**区分
+//! （见 `copper_module_abi::ipc`）：
 //!
-//!    （`register` 内部以 `ModuleOrigin::Addon` 登记，使模块来源如实标注为附加模块。）
-//! 3. 模块命令当前**不会自动出现在前端的 `invoke` 命令表**中；前端的 `api.ts` 会把
-//!    「命令未注册」归一化为可读状态并展示为「命令不可用」，而不是假装成功
-//!    （见本仓库 `AGENTS.md` 第二节与设计文档 4.4）。
+//! | 前缀 | 来源 | 返回值语义 |
+//! |---|---|---|
+//! | `event.<事件名>` | 宿主推送的内核事件 | 宿主忽略返回值 |
+//! | `intent.<意图名>` | 宿主转发的他人意图请求 | 返回值即意图响应，回给请求方 |
+//! | 其它 | 前端经 `module_invoke` 调用的模块命令 | 返回值即命令结果 |
 //!
-//! ## 阶段二（内核待实现）
-//!
-//! 内核支持附加模块动态加载后，本 crate 编译为动态库，由内核装载并注册命令；
-//! 命令契约（`commands.rs` 中的命令名与参数形状）保持不变，前端无需改动。
+//! `event.` 与 `intent.` 是宿主保留前缀，模块**不得**注册同名命令。
 
-pub mod commands;
-pub mod intents;
-pub mod manifest;
-pub mod module;
-pub mod service;
-pub mod storage;
+mod commands;
+mod contract;
+mod error;
+mod host;
+mod intents;
+mod service;
+mod state;
+mod storage;
 
-use copper_core_lib::registry::modules::{ModuleOrigin, ModuleRegistry};
-use copper_core_lib::error::KernelError;
+use std::ffi::c_void;
+use std::path::PathBuf;
 
-pub use manifest::{Manifest, ManifestError};
-pub use module::{DemoModule, I18N_NAMESPACE, MANIFEST_JSON, MODULE_ID};
+use copper_module_abi::plugin_abi::{
+    AbiBuffer, AbiBytes, HostApi, ABI_STATUS_BUFFER_TOO_SMALL, ABI_STATUS_ERROR, ABI_STATUS_OK,
+};
+use serde::Deserialize;
+use serde_json::Value;
 
-/// 向内核模块注册表登记本模块（来源标记为附加模块）。
-///
-/// 为什么用 `register_with_origin(.., Addon)` 而不是 `register(..)`：后者默认按内置处理，
-/// 会让模块绕过沙箱管辖，属于安全相关的默认值错误（内核源码 `registry/modules.rs` 的注释
-/// 明确要求附加模块显式声明来源）。
-///
-/// 返回 `Result<(), ManifestError>`：清单无效时应当在装载前就失败，
-/// 而不是把一个 id / 命名空间都不可信的模块塞进注册表。
-pub fn register(registry: &ModuleRegistry) -> Result<(), ManifestError> {
-    // 先自证清单可用：清单是模块一切契约（id / 命名空间 / 迁移 scope / 表前缀）的来源。
-    let manifest = module::manifest_result()?;
+use copper_module_abi::ipc::{
+    PLUGIN_COMMAND_EVENT_PREFIX, PLUGIN_COMMAND_INTENT_PREFIX,
+};
 
-    let instance = std::sync::Arc::new(DemoModule::new());
-    registry.register_with_origin(instance, ModuleOrigin::Addon);
+use crate::commands::DemoCommand;
+use crate::contract::MODULE_ID;
+use crate::state::{identity_summary, PluginState};
 
-    log::info!(
-        "[demo-tools] 已注册到内核（来源=附加模块）: {}",
-        manifest.summary()
-    );
-    Ok(())
+/// 宿主在 `init` 时下发的配置（由内核的 `AddonProxyModule` 组装）。
+#[derive(Debug, Default, Deserialize)]
+struct InitConfig {
+    /// 模块安装目录（只用于日志与自检）。
+    #[serde(default)]
+    module_dir: String,
+    /// 模块版本（与清单一致，由宿主下发）。
+    #[serde(default)]
+    module_version: String,
 }
 
-/// 模块的命令分发入口（阶段二内核装载后由命令框架调用；当前供内核侧手工接线与测试使用）。
+/// 插件初始化：校验宿主 API → 读宿主配置 → 建立实例状态。
 ///
-/// 参数 `name` / `args` 的形状与前端 `call(cmd, args)` 完全一致，
-/// 便于内核侧以最小改动把枚举挂到命令宏上。
-pub fn dispatch_command(
-    kernel: &copper_core_lib::state::KernelContext,
-    name: &str,
-    args: serde_json::Value,
-) -> Result<serde_json::Value, KernelError> {
-    let cmd = commands::DemoCommand::parse(name, args)?;
-    commands::dispatch(kernel, cmd)
-}
+/// 任何一步失败都返回错误状态：让内核把该模块标记为装载失败并给出原因，
+/// 好过带着半初始化状态继续跑（那种问题表现为"运行起来没反应"，最难查）。
+unsafe extern "C" fn init(
+    host: *const HostApi,
+    config: AbiBytes,
+    state_out: *mut *mut c_void,
+) -> i32 {
+    if host.is_null() || state_out.is_null() {
+        return ABI_STATUS_ERROR;
+    }
+    let host_ref = unsafe { &*host };
+    // 结构与版本校验交给 ABI 自己：宿主与插件各持一份定义，只有这里能发现漂移。
+    if host_ref.validate().is_err() {
+        return ABI_STATUS_ERROR;
+    }
 
-/// 模块自检入口（仅调试构建提供）。
-///
-/// 用途：阶段一没有前端包装配链路，模块开发时需要一个「不依赖 Tauri 界面」的验证入口，
-/// 打印清单摘要、迁移版本、表名前缀、意图与事件契约，便于对照本仓库文档逐条核对。
-/// **不引入 tauri**，因此可以在 `cargo test` / 独立可执行中直接调用。
-#[cfg(debug_assertions)]
-pub fn run_self_check() {
-    match module::manifest_result() {
-        Ok(m) => {
-            println!("[自检] 清单: {}", m.summary());
-            println!(
-                "[自检] 契约: i18n_namespace={} | 迁移 scope={} | 表前缀={}",
-                m.i18n_namespace,
-                m.migration_scope(),
-                m.table_prefix()
-            );
-            println!(
-                "[自检] 数据库迁移: 目标版本={}，已定义 {} 项（{}）",
-                storage::TARGET_SCHEMA_VERSION,
-                storage::MIGRATIONS.len(),
-                storage::MIGRATIONS
-                    .iter()
-                    .map(|m| format!("v{}:{}", m.version, m.name))
-                    .collect::<Vec<_>>()
-                    .join(" / ")
-            );
-            println!(
-                "[自检] 意图: 声明 {:?}；发起 {}（未声明时返回可读降级）",
-                intents::declared_intents(),
-                intents::INTENT_EXPOSE_VERSION
-            );
-            println!(
-                "[自检] 事件: 订阅 {} | 发布 {}",
-                module::SUBSCRIBED_EVENT,
-                module::ACTIVITY_EVENT
-            );
+    let Some(config) = (unsafe { abi_bytes_to_vec(config) }) else {
+        return ABI_STATUS_ERROR;
+    };
+    let parsed: InitConfig = match serde_json::from_slice(&config) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("[demo-tools] 无法解析宿主配置: {error}");
+            return ABI_STATUS_ERROR;
         }
-        Err(e) => println!("[自检] 清单无效: {}", e.friendly()),
-    }
+    };
 
-    println!(
-        "[自检] 命令契约（与前端 api.ts 逐字一致，共 {} 条）: {}",
-        commands::ALL_COMMANDS.len(),
-        commands::ALL_COMMANDS.join(" / ")
+    let state = Box::new(unsafe {
+        PluginState::new(
+            host,
+            PathBuf::from(&parsed.module_dir),
+            parsed.module_version.clone(),
+        )
+    });
+    log::info!(
+        "[demo-tools] 插件已初始化：{}",
+        identity_summary(state.module_dir(), state.module_version())
     );
 
-    match module::is_instance_running() {
-        true => println!("[自检] 模块实例: 已构造并存活"),
-        false => println!("[自检] 模块实例: 未构造（尚未调用 register）"),
+    unsafe { *state_out = Box::into_raw(state) as *mut c_void };
+    ABI_STATUS_OK
+}
+
+/// 插件启动：登记启动活动（会作为模块自有事件发布给前端）。
+unsafe extern "C" fn start(state: *mut c_void) -> i32 {
+    let Some(state) = (unsafe { (state as *mut PluginState).as_mut() }) else {
+        return ABI_STATUS_ERROR;
+    };
+    state.mark_started();
+    state.record_activity("module.start", format!("{MODULE_ID} 已启动"));
+    ABI_STATUS_OK
+}
+
+/// 插件调用入口：三件事（事件 / 意图 / 命令）共用，靠保留前缀区分。
+unsafe extern "C" fn invoke(
+    state: *mut c_void,
+    operation: AbiBytes,
+    input: AbiBytes,
+    output: *mut AbiBuffer,
+) -> i32 {
+    let Some(state) = (unsafe { (state as *mut PluginState).as_mut() }) else {
+        return ABI_STATUS_ERROR;
+    };
+    if output.is_null() {
+        return ABI_STATUS_ERROR;
     }
+    let output = unsafe { &mut *output };
+
+    let Some(operation) = (unsafe { abi_bytes_to_string(operation) }) else {
+        return ABI_STATUS_ERROR;
+    };
+    let args = match unsafe { abi_bytes_to_vec(input) } {
+        Some(bytes) if bytes.is_empty() => Value::Null,
+        Some(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        None => return ABI_STATUS_ERROR,
+    };
+
+    // 内核事件：宿主忽略返回值，出错如实上报即可（没有"回给谁"的问题）。
+    if let Some(event) = operation.strip_prefix(PLUGIN_COMMAND_EVENT_PREFIX) {
+        return match state.on_kernel_event(event, args) {
+            Ok(_) => write_json(output, &Value::Object(Default::default())),
+            Err(error) => {
+                eprintln!("[demo-tools] 处理内核事件 `{event}` 失败: {error}");
+                ABI_STATUS_ERROR
+            }
+        };
+    }
+
+    // 意图转发：返回值会被宿主回给**请求方**，因此必须返回意图本身的响应形状，
+    // 不能套命令信封（信封是给前端命令用的，见 `commands` 的文件说明）。
+    if let Some(intent) = operation.strip_prefix(PLUGIN_COMMAND_INTENT_PREFIX) {
+        return match intents::handle(intent, args) {
+            Ok(value) => write_json(output, &value),
+            Err(error) => {
+                eprintln!("[demo-tools] 意图 `{intent}` 处理失败: {error}");
+                ABI_STATUS_ERROR
+            }
+        };
+    }
+
+    // 前端命令：插件 ABI 没有结构化错误通道，故始终返回 OK，把失败装进响应信封。
+    let result = DemoCommand::parse(&operation, args)
+        .and_then(|command| commands::dispatch(state, command));
+    write_json(output, &commands::envelope(result))
+}
+
+/// 插件停止：清空运行期状态（命令随即不可用，见 `commands::dispatch`）。
+unsafe extern "C" fn stop(state: *mut c_void) -> i32 {
+    let Some(state) = (unsafe { (state as *mut PluginState).as_mut() }) else {
+        return ABI_STATUS_ERROR;
+    };
+    state.mark_stopped();
+    log::info!("[demo-tools] 插件已停止");
+    ABI_STATUS_OK
+}
+
+/// 归还插件实例状态。
+///
+/// 宿主保证 `destroy` 最多被调用一次（`PluginInstance` 自己做了幂等），
+/// 这里按"交出所有权"处理：`Box::from_raw` 后立即 drop。
+unsafe extern "C" fn destroy(state: *mut c_void) {
+    if state.is_null() {
+        return;
+    }
+    drop(unsafe { Box::from_raw(state as *mut PluginState) });
+}
+
+/// 把 JSON 写入宿主提供的输出缓冲；容量不足时按 ABI 协议上报需求长度。
+fn write_json(output: &mut AbiBuffer, value: &Value) -> i32 {
+    match serde_json::to_vec(value) {
+        Ok(encoded) => write_output(output, &encoded),
+        Err(error) => {
+            eprintln!("[demo-tools] 响应序列化失败: {error}");
+            ABI_STATUS_ERROR
+        }
+    }
+}
+
+/// 把字节写入宿主提供的输出缓冲。
+///
+/// 容量不足时**必须**写回所需长度再返回 `BUFFER_TOO_SMALL`：宿主据此扩容重试
+/// （这是 ABI 约定的唯一"我要更大缓冲"的表达方式）。
+fn write_output(output: &mut AbiBuffer, bytes: &[u8]) -> i32 {
+    let required = bytes.len() as u64;
+    if output.ptr.is_null() || output.capacity < required {
+        output.len = required;
+        return ABI_STATUS_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), output.ptr, bytes.len());
+    }
+    output.len = required;
+    ABI_STATUS_OK
+}
+
+/// 读取宿主/自身提供的字节块。拷贝而非借用：跨 ABI 的裸指针无法携带生命周期。
+unsafe fn abi_bytes_to_vec(bytes: AbiBytes) -> Option<Vec<u8>> {
+    if bytes.len == 0 {
+        return Some(Vec::new());
+    }
+    if bytes.ptr.is_null() {
+        return None;
+    }
+    let len = usize::try_from(bytes.len).ok()?;
+    Some(unsafe { std::slice::from_raw_parts(bytes.ptr, len) }.to_vec())
+}
+
+unsafe fn abi_bytes_to_string(bytes: AbiBytes) -> Option<String> {
+    String::from_utf8(unsafe { abi_bytes_to_vec(bytes) }?).ok()
+}
+
+copper_module_abi::copper_module_plugin! {
+    id = "copper-lamp.demo-tools",
+    init = init,
+    start = start,
+    invoke = invoke,
+    stop = stop,
+    destroy = destroy,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 命令名常量与前端契约的最终防线：本测试跨文件复述一次契约字符串，
-    /// 使「两侧各自改名」这种单侧改动无法静默通过。
     #[test]
-    fn command_contract_is_frozen() {
-        let expected = [
-            "demo_tools_overview",
-            "demo_tools_notes_list",
-            "demo_tools_note_upsert",
-            "demo_tools_note_delete",
-            "demo_tools_ping",
-            "demo_tools_expose_version",
-            "demo_tools_activity_recent",
-        ];
-        assert_eq!(commands::ALL_COMMANDS, &expected);
+    fn plugin_id_matches_the_manifest_constant() {
+        // 宏参数与常量必须一致：宏里的 id 决定宿主校验用的函数表身份，
+        // 常量决定能力调用时使用的身份，两者漂移会让插件被内核拒绝装载。
+        assert_eq!(MODULE_ID, "copper-lamp.demo-tools");
+        assert!(contract::MANIFEST_JSON.contains(MODULE_ID));
     }
 
     #[test]
-    fn manifest_embedded_at_compile_time_matches_module_id() {
-        assert!(MANIFEST_JSON.contains("\"copper-lamp.demo-tools\""));
-        let m = Manifest::parse_and_validate(MANIFEST_JSON).unwrap();
-        assert_eq!(m.id, MODULE_ID);
-        assert_eq!(m.i18n_namespace, I18N_NAMESPACE);
+    fn output_writer_reports_required_capacity_when_too_small() {
+        let mut small = [0_u8; 2];
+        let mut output = AbiBuffer {
+            ptr: small.as_mut_ptr(),
+            capacity: small.len() as u64,
+            len: 0,
+        };
+
+        let status = write_output(&mut output, b"{\"ok\":true}");
+
+        assert_eq!(status, ABI_STATUS_BUFFER_TOO_SMALL);
+        assert_eq!(output.len, 11, "必须写回所需长度，宿主才会扩容重试");
     }
 
     #[test]
-    fn dispatch_command_rejects_unknown_command() {
-        // 无 KernelContext 时也应先做参数层校验：未知命令立刻失败，不触碰内核。
-        let err = commands::DemoCommand::parse("nope", serde_json::Value::Null).unwrap_err();
-        assert!(err.friendly().contains("nope"));
+    fn output_writer_copies_when_it_fits() {
+        let mut buffer = [0_u8; 32];
+        let mut output = AbiBuffer {
+            ptr: buffer.as_mut_ptr(),
+            capacity: buffer.len() as u64,
+            len: 0,
+        };
+
+        let status = write_output(&mut output, b"{\"ok\":true}");
+
+        assert_eq!(status, ABI_STATUS_OK);
+        assert_eq!(&buffer[..output.len as usize], b"{\"ok\":true}");
+    }
+
+    #[test]
+    fn init_config_defaults_are_permissive() {
+        // 宿主可能不下发某些字段（例如测试夹具）；缺字段应能初始化而不是直接失败。
+        let config: InitConfig = serde_json::from_slice(b"{}").unwrap();
+        assert!(config.module_dir.is_empty());
+        assert!(config.module_version.is_empty());
     }
 }

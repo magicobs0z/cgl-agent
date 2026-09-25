@@ -1,87 +1,48 @@
-//! 模块持久化：`migrate_scope` 迁移 + 笔记表读写访问器。
+//! 笔记持久化：走宿主的**模块私有存储**能力（KV），不再直接访问数据库。
 //!
-//! 三条由内核源码定死的规则（设计文档 2.7.3 / 2.8.1）：
-//! 1. 迁移 scope 用**完整 id**：`"module:copper-lamp.demo-tools"`。scope 只是
-//!    `schema_migrations` 表里的文本值，不参与标识符解析，点号安全。
-//! 2. 表名前缀用 id 派生（`.` 与 `-` 换 `_`）：`module_copper_lamp_demo_tools_`。
-//!    SQLite 标识符不允许含点号，此处**必须**替换，与 scope 的处理刻意不同。
-//! 3. 所有读写走 `kernel.db().with_conn(...)`；**闭包内不得再调用 `DatabaseService`
-//!    的锁方法**（`schema_version` / `exec_batch` / `migrate_scope` / 嵌套 `with_conn`），
-//!    否则同一把互斥锁重入会死锁。因此本文件的辅助函数只接收 `&Connection`，
-//!    不接收 `&DatabaseService`。
+//! # 为什么不是 SQL
+//!
+//! 附加模块跑在独立进程里，内核不再把数据库连接交给模块——模块只能经 `storage.*`
+//! 操作自己的命名空间（命名空间由**会话身份**决定，模块无法访问别人的数据）。
+//! 代价是失去查询能力：过滤与排序都在模块侧做。换来的是"模块碰不到别人的数据"
+//! 这一确定性，以及模块崩溃不再可能损坏内核库。
+//!
+//! # 键布局
+//!
+//! - `note.<id>`：单条笔记的 JSON；
+//! - `meta.next-id`：下一个可用 id（单调递增）。
+//!
+//! 用键前缀而不是"整个列表存一个键"：单条读写不会互相覆盖，也就不会出现
+//! "两个操作并发时后写的把前一条抹掉"。
 
-use copper_core_lib::error::KernelError;
-use copper_core_lib::services::database::Migration;
-use copper_core_lib::state::KernelContext;
-use rusqlite::{Connection, OptionalExtension, Row};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
-use crate::manifest;
-use crate::module::MODULE_ID;
+use crate::error::ModuleError;
+use crate::host::HostClient;
 
-/// 模块数据库表名前缀（`copper-lamp.demo-tools` → `module_copper_lamp_demo_tools_`）。
-///
-/// 由 [`manifest::table_prefix_for`] 派生而非硬编码字符串：表名前缀是 id 的纯函数，
-/// 两处各写一份必然漂移。此常量的值由单元测试锁定。
-pub const TABLE_PREFIX: &str = "module_copper_lamp_demo_tools_";
-
-/// 笔记表全名。
-pub const NOTE_TABLE: &str = "module_copper_lamp_demo_tools_note";
-
-/// 迁移 scope：与 [`MODULE_ID`] 拼装，避免 scope 与 id 各写一份。
-pub const MIGRATION_SCOPE: &str = "module:copper-lamp.demo-tools";
+/// 笔记键前缀。
+pub const KEY_PREFIX: &str = "note.";
+/// 自增 id 的存储键。
+pub const KEY_NEXT_ID: &str = "meta.next-id";
 
 /// 笔记标题与正文的最大长度。
 ///
-/// 为什么限制：模块表是内核数据库的一部分，超长文本（如误贴百 MB 日志）会拖慢
-/// 数据库文件与备份；这是模块侧的自保阀值，不是内核限制。
+/// 为什么限制：模块存储有配额，超长文本（如误贴百 MB 日志）会先撞配额再报错；
+/// 这里给出可读的拒绝原因，而不是让用户看到底层配额错误。
 pub const MAX_TITLE_LEN: usize = 200;
 pub const MAX_BODY_LEN: usize = 64 * 1024;
 
-/// 迁移 v1：建笔记表。
-const MIGRATION_V1_SQL: &str = "
-CREATE TABLE IF NOT EXISTS module_copper_lamp_demo_tools_note (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    title      TEXT    NOT NULL,
-    body       TEXT    NOT NULL DEFAULT '',
-    pinned     INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-";
-
-/// 迁移 v2：支持「置顶」并加快按标题检索。
-///
-/// v2 拆成两步是刻意的：`ALTER TABLE ... ADD COLUMN` 不能带非恒定默认值，
-/// 且 SQLite 不支持 `ADD COLUMN IF NOT EXISTS`，重复执行会报 duplicate column；
-/// 迁移框架按版本号只执行一次，故这里依赖框架的幂等记录而非 SQL 本身的幂等。
-const MIGRATION_V2_SQL: &str = "
-ALTER TABLE module_copper_lamp_demo_tools_note ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
-CREATE INDEX IF NOT EXISTS idx_module_copper_lamp_demo_tools_note_updated
-    ON module_copper_lamp_demo_tools_note(updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_module_copper_lamp_demo_tools_note_pinned
-    ON module_copper_lamp_demo_tools_note(pinned DESC, updated_at DESC);
-";
-
-/// 模块迁移表。顺序无关紧要（框架按 `version` 升序执行），但保持书写顺序与版本一致。
-pub const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "demo_tools_note",
-        sql: MIGRATION_V1_SQL,
-    },
-    Migration {
-        version: 2,
-        name: "demo_tools_note_pinned_index",
-        sql: MIGRATION_V2_SQL,
-    },
-];
-
-/// 当前迁移目标版本（自检入口展示用）。
-pub const TARGET_SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
+/// 默认列表条数。
+pub const DEFAULT_LIST_LIMIT: u32 = 50;
+/// 列表条数上限：防止前端一次拉全表。
+pub const MAX_LIST_LIMIT: u32 = 500;
 
 /// 一条笔记。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// 字段与序列化形态（camelCase）是**前端契约**：与旧版同进程实现逐字一致，
+/// 迁移不改前端可见形状。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Note {
     pub id: i64,
@@ -105,192 +66,108 @@ pub struct NoteQuery {
     pub offset: Option<u32>,
 }
 
-/// 默认列表条数。
-pub const DEFAULT_LIST_LIMIT: u32 = 50;
-
-/// 列表条数上限：防止前端一次拉全表。
-pub const MAX_LIST_LIMIT: u32 = 500;
-
-/// 应用迁移（在 `Module::init` 中调用）。
-///
-/// 单独包一层而不是让调用方拼 scope 字符串：scope 写错不会报错，只会让迁移记录
-/// 落到另一个作用域、下次启动重复执行建表语句。
-pub fn migrate(kernel: &KernelContext) -> Result<(), KernelError> {
-    debug_assert_eq!(
-        MIGRATION_SCOPE,
-        format!("module:{MODULE_ID}"),
-        "迁移 scope 必须由 MODULE_ID 派生，改 id 时同步改此处"
-    );
-    kernel.db().migrate_scope(MIGRATION_SCOPE, MIGRATIONS)
-}
-
-/// 查询已应用的最高迁移版本。
-pub fn applied_version(kernel: &KernelContext) -> Result<u32, KernelError> {
-    // 注意：`schema_version` 内部会取数据库锁，因此**不能**放在 with_conn 闭包里调用。
-    kernel.db().schema_version(MIGRATION_SCOPE)
-}
-
 /// 新增或更新一条笔记，返回落库后的完整行。
 ///
-/// `id` 为 `None` 时插入，`Some` 时更新（更新不存在的 id 返回 [`KernelError::InvalidArgument`]，
+/// `id` 为 `None` 时插入，`Some` 时更新（更新不存在的 id 返回参数错误，
 /// 而不是静默变成插入——静默插入会让前端拿到的 id 与预期不符）。
 pub fn put_note(
-    kernel: &KernelContext,
+    host: &HostClient,
     id: Option<i64>,
     title: &str,
     body: &str,
     pinned: bool,
-) -> Result<Note, KernelError> {
+) -> Result<Note, ModuleError> {
     let title = title.trim();
     if title.is_empty() {
-        return Err(KernelError::InvalidArgument("笔记标题不能为空".into()));
+        return Err(ModuleError::InvalidArgument("笔记标题不能为空".into()));
     }
     if title.chars().count() > MAX_TITLE_LEN {
-        return Err(KernelError::InvalidArgument(format!(
+        return Err(ModuleError::InvalidArgument(format!(
             "笔记标题不得超过 {MAX_TITLE_LEN} 字符"
         )));
     }
     if body.len() > MAX_BODY_LEN {
-        return Err(KernelError::InvalidArgument(format!(
+        return Err(ModuleError::InvalidArgument(format!(
             "笔记正文不得超过 {MAX_BODY_LEN} 字节"
         )));
     }
 
     let now = now_secs();
-    kernel.db().with_conn(|conn| match id {
+    let note = match id {
         Some(id) => {
-            let changed = conn.execute(
-                &format!(
-                    "UPDATE {NOTE_TABLE} SET title = ?1, body = ?2, pinned = ?3, updated_at = ?4 WHERE id = ?5"
-                ),
-                rusqlite::params![title, body, pinned as i64, now, id],
-            )?;
-            if changed == 0 {
-                return Err(KernelError::InvalidArgument(format!(
-                    "笔记 {id} 不存在，无法更新"
-                )));
+            let existing = read_note(host, id)?.ok_or_else(|| {
+                ModuleError::InvalidArgument(format!("笔记 {id} 不存在，无法更新"))
+            })?;
+            Note {
+                id,
+                title: title.to_owned(),
+                body: body.to_owned(),
+                pinned,
+                created_at: existing.created_at,
+                updated_at: now,
             }
-            read_note(conn, id)?.ok_or_else(|| {
-                // 更新后读不到只可能是并发删除；如实报错而不是伪造返回。
-                KernelError::Database(rusqlite::Error::QueryReturnedNoRows)
-            })
         }
-        None => {
-            conn.execute(
-                &format!(
-                    "INSERT INTO {NOTE_TABLE} (title, body, pinned, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)"
-                ),
-                rusqlite::params![title, body, pinned as i64, now],
-            )?;
-            let id = conn.last_insert_rowid();
-            read_note(conn, id)?.ok_or_else(|| {
-                KernelError::Database(rusqlite::Error::QueryReturnedNoRows)
-            })
-        }
-    })
+        None => Note {
+            id: allocate_id(host)?,
+            title: title.to_owned(),
+            body: body.to_owned(),
+            pinned,
+            created_at: now,
+            updated_at: now,
+        },
+    };
+
+    write_note(host, &note)?;
+    Ok(note)
 }
 
 /// 按条件列出笔记（置顶优先，其次按更新时间倒序）。
-pub fn list_notes(kernel: &KernelContext, query: &NoteQuery) -> Result<Vec<Note>, KernelError> {
+pub fn list_notes(host: &HostClient, query: &NoteQuery) -> Result<Vec<Note>, ModuleError> {
     let limit = query
         .limit
         .unwrap_or(DEFAULT_LIST_LIMIT)
-        .min(MAX_LIST_LIMIT);
-    let offset = query.offset.unwrap_or(0);
+        .min(MAX_LIST_LIMIT) as usize;
+    let offset = query.offset.unwrap_or(0) as usize;
     let keyword = query
         .search
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| format!("%{s}%"));
+        .map(str::to_lowercase);
 
-    kernel.db().with_conn(|conn| {
-        // 过滤条件用参数占位而非字符串拼接：标题来自用户输入，拼接会造成 SQL 注入。
-        let mut sql = format!("SELECT id, title, body, pinned, created_at, updated_at FROM {NOTE_TABLE} WHERE 1 = 1");
-        if query.only_pinned {
-            sql.push_str(" AND pinned = 1");
-        }
-        if keyword.is_some() {
-            sql.push_str(" AND (title LIKE ?1 OR body LIKE ?1)");
-        }
-        sql.push_str(" ORDER BY pinned DESC, updated_at DESC, id DESC LIMIT ?2 OFFSET ?3");
+    let mut notes = load_all(host)?;
 
-        // 参数个数随条件变化，故按存在性分别绑定，避免用 NULL 占位绕开的写法。
-        let (kw, lim, off) = (keyword.clone(), limit, offset);
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = if let Some(kw) = kw {
-            stmt.query_map(rusqlite::params![kw, lim, off], map_note)?
-        } else {
-            // 占位符编号从 ?2 开始，故此处显式用 2/3。
-            stmt.query_map(rusqlite::params![lim, off], map_note)?
-        };
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    })
-}
+    if query.only_pinned {
+        notes.retain(|note| note.pinned);
+    }
+    if let Some(keyword) = keyword {
+        // 注意：KV 没有 LIKE，匹配在模块侧做。这里用 Unicode 小写比较，
+        // 因此中文与大小写混排的标题都能命中（旧版 SQLite 的 LIKE 只对 ASCII 忽略大小写）。
+        notes.retain(|note| {
+            note.title.to_lowercase().contains(&keyword)
+                || note.body.to_lowercase().contains(&keyword)
+        });
+    }
 
-/// 按 id 读取一条笔记。
-pub fn get_note(kernel: &KernelContext, id: i64) -> Result<Option<Note>, KernelError> {
-    kernel.db().with_conn(|conn| read_note(conn, id))
+    notes.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then(b.updated_at.cmp(&a.updated_at))
+            .then(b.id.cmp(&a.id))
+    });
+
+    Ok(notes.into_iter().skip(offset).take(limit).collect())
 }
 
 /// 删除一条笔记，返回是否确实删除。
-pub fn delete_note(kernel: &KernelContext, id: i64) -> Result<bool, KernelError> {
-    kernel
-        .db()
-        .with_conn(|conn| {
-            let changed = conn.execute(
-                &format!("DELETE FROM {NOTE_TABLE} WHERE id = ?1"),
-                rusqlite::params![id],
-            )?;
-            Ok(changed > 0)
-        })
+pub fn delete_note(host: &HostClient, id: i64) -> Result<bool, ModuleError> {
+    let response = host.call("storage.remove", &json!({ "key": note_key(id) }))?;
+    Ok(response["removed"].as_bool().unwrap_or(false))
 }
 
 /// 笔记总数。
-pub fn note_count(kernel: &KernelContext) -> Result<i64, KernelError> {
-    kernel.db().with_conn(|conn| {
-        let count = conn.query_row(
-            &format!("SELECT COUNT(*) FROM {NOTE_TABLE}"),
-            [],
-            |r| r.get::<_, i64>(0),
-        )?;
-        Ok(count)
-    })
-}
-
-/// 清空全部笔记（`stop` 阶段不调用；仅供调试入口与测试使用）。
-pub fn clear_notes(kernel: &KernelContext) -> Result<usize, KernelError> {
-    kernel.db().with_conn(|conn| {
-        let changed = conn.execute(&format!("DELETE FROM {NOTE_TABLE}"), [])?;
-        Ok(changed)
-    })
-}
-
-// ------------------------------------------------------------------ 内部
-
-/// 读取单行（在 `with_conn` 闭包内使用）。
-fn read_note(conn: &Connection, id: i64) -> Result<Option<Note>, KernelError> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT id, title, body, pinned, created_at, updated_at FROM {NOTE_TABLE} WHERE id = ?1"
-    ))?;
-    let note = stmt.query_row(rusqlite::params![id], map_note).optional()?;
-    Ok(note)
-}
-
-/// 行 → [`Note`] 的映射（`pinned` 在 SQLite 里是 0/1 整数）。
-fn map_note(row: &Row<'_>) -> Result<Note, rusqlite::Error> {
-    Ok(Note {
-        id: row.get(0)?,
-        title: row.get(1)?,
-        body: row.get(2)?,
-        pinned: row.get::<_, i64>(3)? != 0,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
-    })
+pub fn note_count(host: &HostClient) -> Result<i64, ModuleError> {
+    Ok(list_keys(host, KEY_PREFIX)?.len() as i64)
 }
 
 /// 当前 Unix 秒。用不上 chrono：模块只需要单调递增的排序键，
@@ -302,46 +179,126 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+// ------------------------------------------------------------------ 内部
+
+fn note_key(id: i64) -> String {
+    format!("{KEY_PREFIX}{id}")
+}
+
+/// 读出全部笔记（损坏的单条会被跳过并告警，而不是让整次列表失败）。
+fn load_all(host: &HostClient) -> Result<Vec<Note>, ModuleError> {
+    let mut notes = Vec::new();
+    for key in list_keys(host, KEY_PREFIX)? {
+        match read_note_by_key(host, &key) {
+            Ok(Some(note)) => notes.push(note),
+            // 单条损坏不该让整个列表不可用：留痕后跳过，用户仍能看到其余笔记。
+            Ok(None) => log::warn!("[demo-tools] 存储键 `{key}` 无值，已跳过"),
+            Err(error) => log::warn!("[demo-tools] 存储键 `{key}` 解析失败，已跳过: {error}"),
+        }
+    }
+    Ok(notes)
+}
+
+fn read_note(host: &HostClient, id: i64) -> Result<Option<Note>, ModuleError> {
+    read_note_by_key(host, &note_key(id))
+}
+
+fn read_note_by_key(host: &HostClient, key: &str) -> Result<Option<Note>, ModuleError> {
+    let response = host.call("storage.get", &json!({ "key": key }))?;
+    let value = &response["value"];
+    if value.is_null() {
+        return Ok(None);
+    }
+    // 反序列化失败必须上报：静默当成"没有这条"会让损坏数据永远不可见。
+    Ok(Some(serde_json::from_value(value.clone())?))
+}
+
+fn write_note(host: &HostClient, note: &Note) -> Result<(), ModuleError> {
+    let value = serde_json::to_value(note)?;
+    host.call(
+        "storage.set",
+        &json!({ "key": note_key(note.id), "value": value }),
+    )?;
+    Ok(())
+}
+
+fn list_keys(host: &HostClient, prefix: &str) -> Result<Vec<String>, ModuleError> {
+    let response = host.call("storage.list", &json!({ "prefix": prefix }))?;
+    Ok(response["keys"]
+        .as_array()
+        .map(|keys| {
+            keys.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// 分配下一个 id。
+///
+/// 计数器与笔记数据同在模块自己的命名空间里：内核不提供自增，模块也不该依赖
+/// 时间戳做 id（同一秒内的连续新增会撞号）。
+fn allocate_id(host: &HostClient) -> Result<i64, ModuleError> {
+    let response = host.call("storage.get", &json!({ "key": KEY_NEXT_ID }))?;
+    let last = response["value"].as_i64().unwrap_or(0);
+    let next = last + 1;
+    host.call(
+        "storage.set",
+        &json!({ "key": KEY_NEXT_ID, "value": next }),
+    )?;
+    Ok(next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 表名前缀必须由 id 派生，且本文件的常量与派生结果一致。
     #[test]
-    fn table_prefix_matches_manifest_derivation() {
-        assert_eq!(manifest::table_prefix_for(MODULE_ID), TABLE_PREFIX);
-        assert_eq!(TABLE_PREFIX, "module_copper_lamp_demo_tools_");
+    fn note_keys_are_namespaced_and_stable() {
+        assert_eq!(note_key(7), "note.7");
+        assert!(note_key(7).starts_with(KEY_PREFIX));
+        // id 键与元数据键不得互相前缀包含，否则前缀列举会多出/漏掉条目。
+        assert!(!KEY_PREFIX.starts_with(KEY_NEXT_ID));
+        assert!(!KEY_NEXT_ID.starts_with(KEY_PREFIX));
     }
 
     #[test]
-    fn note_table_uses_prefix() {
-        assert!(NOTE_TABLE.starts_with(TABLE_PREFIX), "表名必须带模块前缀");
-        // 标识符不得含点号：SQLite 不加引号时无法解析。
-        assert!(!NOTE_TABLE.contains('.'), "表名不得含点号");
+    fn empty_title_is_rejected_before_any_capability_call() {
+        // 无宿主客户端时也必须先做参数校验：非法输入不该走到能力调用。
+        // 这里用 `None` 指针构造客户端，若发生能力调用会立刻失败而不是 panic。
+        let client = unsafe { HostClient::new(std::ptr::null()) };
+        let error = put_note(&client, None, "   ", "body", false).unwrap_err();
+        assert_eq!(error.kind(), "invalid_argument");
+        assert!(error.friendly().contains("标题"));
     }
 
     #[test]
-    fn migration_scope_uses_full_id() {
-        // scope 是文本值，保留完整 id（含点号与连字符），与内置模块同构。
-        assert_eq!(MIGRATION_SCOPE, format!("module:{MODULE_ID}"));
+    fn oversized_title_and_body_are_rejected() {
+        let client = unsafe { HostClient::new(std::ptr::null()) };
+
+        let long_title = "t".repeat(MAX_TITLE_LEN + 1);
+        assert!(put_note(&client, None, &long_title, "", false).is_err());
+
+        let long_body = "b".repeat(MAX_BODY_LEN + 1);
+        assert!(put_note(&client, None, "ok", &long_body, false).is_err());
     }
 
     #[test]
-    fn migrations_are_version_ascending_and_unique() {
-        let mut prev = 0;
-        for m in MIGRATIONS {
-            assert!(m.version > prev, "迁移版本必须严格递增且不重复");
-            prev = m.version;
-            assert!(!m.name.is_empty(), "迁移必须带可读名字，便于排查");
-            assert!(!m.sql.trim().is_empty(), "迁移 SQL 不能为空");
-        }
-        assert_eq!(TARGET_SCHEMA_VERSION, 2);
-    }
-
-    #[test]
-    fn v2_migration_targets_same_table_as_v1() {
-        // v2 是对同一张表加列 / 加索引；表名写错会在运行期才炸，这里静态锁住。
-        assert!(MIGRATION_V2_SQL.contains(NOTE_TABLE));
-        assert!(MIGRATION_V1_SQL.contains(NOTE_TABLE));
+    fn note_serializes_with_camel_case_for_the_frontend() {
+        let note = Note {
+            id: 1,
+            title: "t".into(),
+            body: "b".into(),
+            pinned: true,
+            created_at: 10,
+            updated_at: 20,
+        };
+        let value = serde_json::to_value(&note).unwrap();
+        assert_eq!(value["createdAt"], json!(10));
+        assert_eq!(value["updatedAt"], json!(20));
+        // 回读同一形状（KV 里存的就是这个形态）。
+        let back: Note = serde_json::from_value(value).unwrap();
+        assert_eq!(back, note);
     }
 }

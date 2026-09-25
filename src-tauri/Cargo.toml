@@ -8,27 +8,22 @@ license = "MIT"
 
 # 本 crate 是**独立 workspace**：CopperModles/ 与 D:\CopperGolem\ 下均无 Cargo.toml，
 # 故本目录自成 workspace 根，不会被上层 workspace 捕获。
-# 注意 copper-core 本身是 CopperCore/Cargo.toml（[workspace] members = ["src-tauri", ...]）
-# 的成员，其 edition / license 为 workspace 继承字段；cargo 解析该 path 依赖时会自行
-# 到 CopperCore/Cargo.toml 取继承值，本文件无需（也不应）为它做任何声明。
-# 内核 workspace 的 [profile.release]（lto / codegen-units / panic 等）不会外溢到本 crate：
-# profile 一律取自本 crate 自己的 workspace 根。
 
 [lib]
 # Windows 下 bin 与 lib 同名会触发 cargo issue 8519，
 # 故 lib target 名显式改写为下划线形态；crate（cargo 包名）仍是 copper-module-demo，
 # 与 module.json 的 backend.crate 一致。
 name = "copper_module_demo"
-crate-type = ["lib"]
+# cdylib 是交付形态（内核的 helper 进程用 libloading 加载它）；
+# rlib 只为让 `cargo test` 能链接出测试可执行文件——纯 cdylib 无法被测试目标引用。
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# 阶段一：以内核 path 依赖的形式静态编译进启动器（设计文档 2.9）。
+# 插件 ABI 与宿主 IPC 契约：内核、helper 进程与模块模板共享同一份定义。
 # 路径说明：本文件位于 <root>/src-tauri/，故上溯两级即仓库根，再进 CopperCore。
-copper-core = { path = "../../CopperCore/src-tauri" }
+copper-module-abi = { path = "../../CopperCore/copper-module-abi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# 插件进程内的日志走 stderr（由 helper 转发给内核日志）；没有安装 logger 时是空操作。
 log = "0.4"
-tokio = { version = "1", features = ["rt", "sync", "time"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-parking_lot = "0.12"

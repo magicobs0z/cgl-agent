@@ -103,11 +103,37 @@ export function normalizeApiError(e: unknown, command: string): DemoApiErrorInfo
   return { kind, rawKind, message, command };
 }
 
-/** 调用模块命令并归一化错误。 */
+/** 调用模块命令并拆信封 / 归一化错误。 */
+/** 模块命令的响应信封。
+ *
+ * 为什么需要：附加模块命令在宿主侧始终以 OK 状态回帧（插件 ABI 只回状态码、不带结构化
+ * 错误），失败由模块自己在信封里表达。不拆信封就会把 `ok:false` 当成功读，页面显示空数据。 */
+interface CommandEnvelope<T> {
+  ok: boolean;
+  data?: T;
+  error?: { kind: string; message: string };
+}
+
 async function callModule<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   try {
-    return await call<T>(cmd, args);
+    const response = await call<CommandEnvelope<T> | T>(cmd, args);
+    if (response !== null && typeof response === "object" && "ok" in response) {
+      const envelope = response as CommandEnvelope<T>;
+      if (!envelope.ok) {
+        // 模块自己报的失败（参数不合法、能力不可用等）：保留它的分类与文案。
+        throw new DemoApiError({
+          kind: "backend",
+          rawKind: envelope.error?.kind ?? "unknown",
+          message: envelope.error?.message ?? cmd,
+          command: cmd,
+        });
+      }
+      return envelope.data as T;
+    }
+    // 兼容不带信封的响应（旧实现或第三方模块）。
+    return response as T;
   } catch (e) {
+    if (e instanceof DemoApiError) throw e;
     throw new DemoApiError(normalizeApiError(e, cmd));
   }
 }
@@ -131,8 +157,11 @@ export interface DemoOverview {
   i18nNamespace: string;
   /** 模块版本（取自 module.json）。 */
   version: string;
-  /** 内核已装载模块数量。 */
-  loadedModules: number;
+  /** 笔记总数（模块存储里的真实数据量）。
+   *
+   * 旧版这里是「内核已装载模块数」——子进程插件拿不到内核注册表，该字段已移除，
+   * 概览改展示插件确实能知道的数字。 */
+  noteCount: number;
   /** 本模块已声明的意图清单。 */
   intents: string[];
 }
