@@ -150,6 +150,28 @@
       },
       "description": "权限声明（授权上界）。模板默认空数组，由作者按真实需要逐项添加；未知名在解析期即被拒绝。"
     },
+    "events": {
+      "type": "array",
+      "uniqueItems": true,
+      "default": [],
+      "items": {
+        "type": "string",
+        "pattern": "^(\\*|[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)*(\\.\\*)?)$",
+        "maxLength": 128
+      },
+      "description": "订阅的事件模式（订阅上界）。支持 `*`、`<点分段名>.*` 与精确名；宿主只按本列表订阅，插件收到的任何事件都必在其中。空数组（默认）表示不接收任何事件。声明非空即视为申请内核的 `events` 能力。"
+    },
+    "intents": {
+      "type": "array",
+      "uniqueItems": true,
+      "default": [],
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)+$",
+        "maxLength": 128
+      },
+      "description": "声明的意图处理器（上界），不允许通配。宿主在模块 start 成功后按本列表登记转发处理器：其他模块请求该意图时，宿主转成一次插件调用 `intent.<意图名>`。空数组（默认）表示不处理任何意图。"
+    },
     "icon": {
       "type": "string",
       "pattern": "^assets/[A-Za-z0-9._/-]+$",

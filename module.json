@@ -23,6 +23,8 @@
   },
   "frontend": { "dist": "frontend/dist", "register": "register.js" },
   "permissions": [],
+  "events": ["download.status"],
+  "intents": ["demo-tools.ping"],
   "icon": "assets/icon.svg",
   "category": "utility",
   "keywords": ["demo", "template", "示例"],
