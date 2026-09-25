@@ -23,7 +23,7 @@
   },
   "frontend": { "dist": "frontend/dist", "register": "register.js" },
   "permissions": [],
-  "events": ["download.status"],
+  "events": { "subscribe": ["download.status"], "publish": ["demo-tools.activity"] },
   "intents": ["demo-tools.ping"],
   "icon": "assets/icon.svg",
   "category": "utility",

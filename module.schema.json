@@ -151,15 +151,35 @@
       "description": "权限声明（授权上界）。模板默认空数组，由作者按真实需要逐项添加；未知名在解析期即被拒绝。"
     },
     "events": {
-      "type": "array",
-      "uniqueItems": true,
-      "default": [],
-      "items": {
-        "type": "string",
-        "pattern": "^(\\*|[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)*(\\.\\*)?)$",
-        "maxLength": 128
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "subscribe": {
+          "type": "array",
+          "uniqueItems": true,
+          "default": [],
+          "items": {
+            "type": "string",
+            "pattern": "^(\\*|[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)*(\\.\\*)?)$",
+            "maxLength": 128
+          },
+          "description": "订阅上界：支持 `*`（全部）、`<点分段名>.*`（前缀）与精确名。宿主只按本列表订阅，插件收到的任何事件都必在其中。空数组（默认）表示不接收任何事件。"
+        },
+        "publish": {
+          "type": "array",
+          "uniqueItems": true,
+          "default": [],
+          "items": {
+            "type": "string",
+            "pattern": "^(\\*|[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)*(\\.\\*)?)$",
+            "maxLength": 128,
+            "not": { "const": "*" }
+          },
+          "description": "发布上界：支持 `<点分段名>.*` 与精确名，**不允许裸 `*`**——那等于允许模块以任意名字发布，包括冒充内核事件名（内核事件会被桥接到前端监听器）。空数组（默认）表示不发布任何事件。"
+        }
       },
-      "description": "订阅的事件模式（订阅上界）。支持 `*`、`<点分段名>.*` 与精确名；宿主只按本列表订阅，插件收到的任何事件都必在其中。空数组（默认）表示不接收任何事件。声明非空即视为申请内核的 `events` 能力。"
+      "description": "事件声明（订阅与发布**各自**的上界）。两个方向分开声明是必要的：能收某事件不代表能以它的名义发布。任一方向非空即视为申请内核的 `events` 能力。"
     },
     "intents": {
       "type": "array",
