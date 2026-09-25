@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>示例工具 · 独立预览</title>
+  </head>
+  <body>
+    <!--
+      dev 独立预览宿主页：仅在 `npm run dev` 下使用。
+      注意入口是 `dev-preview.ts` 而不是 `register.ts`：后者只做注册、不渲染，
+      预览页需要一个最小 Vue 宿主把注册出来的路由挂起来（详见该文件的说明）。
+      正式运行时模块前端由内核 Shell 的宿主页加载（vite lib 产物 register.js），
+      本文件不进入发布包。
+    -->
+    <div id="app"></div>
+    <script type="module" src="/src/dev-preview.ts"></script>
+  </body>
+</html>

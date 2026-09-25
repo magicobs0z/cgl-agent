@@ -1,0 +1,31 @@
+{
+  "schema_version": "1",
+  "id": "copper-lamp.demo-tools",
+  "i18n_namespace": "demo-tools",
+  "display_name": "示例工具",
+  "description": "模块模板自带的示例模块：演示命令、事件、意图、数据库与语言包的最小闭环。",
+  "i18n": {
+    "en-US": {
+      "display_name": "Demo Tools",
+      "description": "Bundled sample module: minimal closed loop for commands, events, intents, DB and locale packs."
+    }
+  },
+  "author": { "name": "copper-lamp", "url": "https://github.com/copper-lamp" },
+  "license": "MIT",
+  "version": "0.1.0",
+  "platforms": ["windows-x86_64"],
+  "launcher": { "min": "0.1.0", "max": null },
+  "api_version": 1,
+  "backend": {
+    "crate": "copper-module-demo",
+    "entry": "copper_module_demo::DemoModule",
+    "artifact_glob": "target/release/copper_module_demo.dll"
+  },
+  "frontend": { "dist": "frontend/dist", "register": "register.js" },
+  "permissions": [],
+  "icon": "assets/icon.svg",
+  "category": "utility",
+  "keywords": ["demo", "template", "示例"],
+  "homepage": "https://github.com/copper-lamp/cgl-models",
+  "changelog": "CHANGELOG.md"
+}

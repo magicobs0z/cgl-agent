@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://copper-lamp.github.io/cgl-models/module.schema.json",
+  "title": "铜傀儡模块清单",
+  "description": "module.json 的唯一权威结构定义：编辑器内实时校验与 CI 校验共用同一份 schema。字段语义与 docs/cgl-models.md 2.3 字段表逐条对应。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "i18n_namespace",
+    "display_name",
+    "description",
+    "author",
+    "license",
+    "version",
+    "platforms",
+    "launcher",
+    "api_version",
+    "backend",
+    "frontend",
+    "permissions",
+    "icon",
+    "category"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1"],
+      "description": "清单格式版本。新增必填字段时递增，内核按此判定兼容。"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)+$",
+      "description": "模块全局唯一标识，两段式 author.module。用途限于唯一标识 / 模块目录名 / DB scope；不用于 i18n 键，也不参与路由。"
+    },
+    "i18n_namespace": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{2,31}$",
+      "description": "i18n 命名空间：单段、不含点号。语言包挂载与 t() 键一律走 module.<i18n_namespace>.<扁平键>。必须显式声明，不得从 id 隐式推导。"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40,
+      "description": "默认展示名（无本地化条目时的兜底）。"
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 400,
+      "description": "默认简介，一句话，建议 120 字以内。收录时由 bot 折叠进条目的 summary locale map。"
+    },
+    "i18n": {
+      "type": "object",
+      "description": "本地化覆盖：locale -> { display_name, description }。",
+      "propertyNames": { "pattern": "^[a-z]{2}-[A-Z]{2}$" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "display_name": { "type": "string", "minLength": 1, "maxLength": 40 },
+          "description": { "type": "string", "minLength": 1, "maxLength": 400 }
+        }
+      }
+    },
+    "author": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "email": { "type": "string" },
+        "url": { "type": "string" }
+      },
+      "description": "作者信息。提审时 contact 优先取 url，缺失取 email，二者皆缺则提审失败。"
+    },
+    "license": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9.+-]+$",
+      "description": "SPDX 标识，须与仓库 LICENSE 文件、README 声明、cgl-libs 条目四处一致。"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "semver，与 git tag、CHANGELOG 严格一致。模块作者不得自行变更，须维护者指令。"
+    },
+    "platforms": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["windows-x86_64", "windows-aarch64", "android-arm64", "linux-x86_64"]
+      },
+      "description": "适配平台，权威枚举与 cgl-libs 逐字一致。声明了但产物缺失的平台，提审校验直接失败。"
+    },
+    "launcher": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min"],
+      "properties": {
+        "min": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "max": { "type": ["string", "null"], "pattern": "^\\d+\\.\\d+\\.\\d+$" }
+      },
+      "description": "内核兼容区间。manifest 侧为嵌套形态，收录时由 bot 展平为 min_launcher / max_launcher。"
+    },
+    "api_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "模块 API 版本，值须与内核当前支持的版本一致，否则内核拒绝装载。"
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["crate", "entry", "artifact_glob"],
+      "properties": {
+        "crate": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "entry": { "type": "string", "minLength": 1 },
+        "artifact_glob": { "type": "string", "minLength": 1 }
+      },
+      "description": "后端 crate 声明：crate 名须与 src-tauri/Cargo.toml 的 name 一致，artifact_glob 供多平台打包矩阵替换。"
+    },
+    "frontend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dist", "register"],
+      "properties": {
+        "dist": { "type": "string", "minLength": 1 },
+        "register": { "type": "string", "pattern": "^[A-Za-z0-9._-]+\\.js$" }
+      },
+      "description": "前端产物声明：dist 为构建目录，register 为注册入口的编译后模块名。"
+    },
+    "permissions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "filesystem:read",
+          "filesystem:write",
+          "filesystem:game-dir",
+          "network",
+          "process:spawn",
+          "download:enqueue",
+          "settings:write",
+          "intents:request",
+          "account:read"
+        ]
+      },
+      "description": "权限声明（授权上界）。模板默认空数组，由作者按真实需要逐项添加；未知名在解析期即被拒绝。"
+    },
+    "icon": {
+      "type": "string",
+      "pattern": "^assets/[A-Za-z0-9._/-]+$",
+      "description": "模块图标：module.json 同级的相对路径，禁止外链。"
+    },
+    "category": {
+      "type": "string",
+      "enum": ["utility", "automation", "content", "integration", "appearance"],
+      "description": "分类枚举，决定模块列表页的分组。"
+    },
+    "keywords": {
+      "type": "array",
+      "maxItems": 10,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "检索关键字，提审进 cgl-libs 后用于列表搜索。"
+    },
+    "homepage": {
+      "type": "string",
+      "pattern": "^https://",
+      "description": "主页 / 源码仓库 URL。提审时映射为条目的 repo，必须是 https 源码仓库地址。"
+    },
+    "donation": {
+      "type": "string",
+      "pattern": "^https://",
+      "description": "赞助链接（可空）。"
+    },
+    "changelog": {
+      "type": "string",
+      "minLength": 1,
+      "description": "变更记录路径，默认 CHANGELOG.md。提审 bot 读取该文件内容并按 locale 归集为条目 changelog。"
+    }
+  }
+}

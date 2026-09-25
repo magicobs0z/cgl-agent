@@ -1,0 +1,50 @@
+name: module-check
+
+# PR / 推送校验：schema 校验 + 语言包键集 + 前端构建 + Rust 测试。**不产物**。
+#
+# 与 CopperCore/.github/workflows/build.yml 保持同一套基线（windows-latest、
+# dtolnay/rust-toolchain@stable、Node 24），便于开发者在两侧仓库间迁移认知。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: 检出模块仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装前端依赖
+        run: npm install
+
+      - name: 校验 module.json（schema + 语义）
+        run: node scripts/validate-manifest.mjs
+
+      - name: 校验语言包键集一致
+        run: node scripts/validate-manifest.mjs --check-locales
+
+      - name: 单元用例（清单与发布包结构）
+        run: node --test tests/
+
+      - name: 构建前端
+        run: npm run build:frontend
+
+      - name: 构建后端并跑测试
+        run: |
+          cargo build --release --manifest-path src-tauri/Cargo.toml
+          cargo test --manifest-path src-tauri/Cargo.toml

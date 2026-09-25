@@ -1,0 +1,423 @@
+/* 模块私有样式：只消费 var(--copper-*) 主题令牌，禁止任何颜色字面量。
+ * 透明叠加一律用 color-mix() 基于令牌推导，保证深浅主题自动适配。
+ * 本文件由 register.ts 引入，随模块产物一起加载（不进内核全局样式表）。 */
+
+.mod-demo {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--copper-space-5);
+  gap: var(--copper-space-4);
+  color: var(--copper-text);
+  font-family: var(--copper-font-family);
+  font-size: var(--copper-font-size-md);
+}
+
+.mod-demo__page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--copper-space-4);
+}
+
+.mod-demo__page-title {
+  font-size: var(--copper-font-size-xl);
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.mod-demo__page-desc {
+  margin-top: var(--copper-space-1);
+  color: var(--copper-text-secondary);
+  font-size: var(--copper-font-size-sm);
+  line-height: 1.5;
+  max-width: 64ch;
+}
+
+/* —— 能力状态横幅 —— */
+
+.mod-demo__capability {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--copper-space-3);
+  padding: var(--copper-space-3) var(--copper-space-4);
+  border-radius: var(--copper-radius-md);
+  border: 1px solid color-mix(in srgb, var(--copper-warning) 45%, transparent);
+  background: color-mix(in srgb, var(--copper-warning) 10%, transparent);
+}
+
+.mod-demo__capability-icon {
+  flex-shrink: 0;
+  color: var(--copper-warning);
+  margin-top: 1px;
+}
+
+.mod-demo__capability-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--copper-space-1);
+  min-width: 0;
+}
+
+.mod-demo__capability-title {
+  font-size: var(--copper-font-size-md);
+  font-weight: 600;
+  color: var(--copper-text);
+}
+
+.mod-demo__capability-desc {
+  font-size: var(--copper-font-size-sm);
+  line-height: 1.55;
+  color: var(--copper-text-secondary);
+}
+
+/* —— 错误态 —— */
+
+.mod-demo__error {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--copper-space-3);
+  padding: var(--copper-space-3) var(--copper-space-4);
+  border-radius: var(--copper-radius-md);
+  border: 1px solid color-mix(in srgb, var(--copper-danger) 45%, transparent);
+  background: color-mix(in srgb, var(--copper-danger) 10%, transparent);
+}
+
+.mod-demo__error-icon {
+  flex-shrink: 0;
+  color: var(--copper-danger);
+  margin-top: 1px;
+}
+
+.mod-demo__error-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--copper-space-1);
+}
+
+.mod-demo__error-title {
+  font-size: var(--copper-font-size-md);
+  font-weight: 600;
+}
+
+.mod-demo__error-detail {
+  font-family: var(--copper-font-family);
+  font-size: var(--copper-font-size-sm);
+  color: var(--copper-text-secondary);
+  line-height: 1.5;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+/* —— 卡片与网格 —— */
+
+.mod-demo__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: var(--copper-space-4);
+  align-items: start;
+}
+
+.mod-demo__card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--copper-space-3);
+  padding: var(--copper-space-4);
+  border: 1px solid var(--copper-border);
+  border-radius: var(--copper-radius-lg);
+  background: var(--copper-surface-2);
+  min-width: 0;
+}
+
+.mod-demo__card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--copper-space-2);
+}
+
+.mod-demo__card-title {
+  display: flex;
+  align-items: center;
+  gap: var(--copper-space-2);
+  font-size: var(--copper-font-size-lg);
+  font-weight: 600;
+}
+
+.mod-demo__card-title-icon {
+  color: var(--copper-accent);
+}
+
+/* —— 键值表（概览字段）—— */
+
+.mod-demo__fields {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--copper-space-2) var(--copper-space-4);
+  align-items: baseline;
+  margin: 0;
+}
+
+.mod-demo__field-label {
+  color: var(--copper-text-secondary);
+  font-size: var(--copper-font-size-sm);
+  white-space: nowrap;
+}
+
+.mod-demo__field-value {
+  margin: 0;
+  min-width: 0;
+  font-size: var(--copper-font-size-md);
+  color: var(--copper-text);
+  word-break: break-word;
+}
+
+.mod-demo__mono {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
+.mod-demo__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--copper-space-2);
+}
+
+.mod-demo__chip {
+  padding: 2px var(--copper-space-3);
+  border-radius: var(--copper-radius-full);
+  border: 1px solid color-mix(in srgb, var(--copper-accent) 40%, transparent);
+  background: color-mix(in srgb, var(--copper-accent) 12%, transparent);
+  color: var(--copper-text);
+  font-size: var(--copper-font-size-xs);
+  white-space: nowrap;
+}
+
+.mod-demo__chip--muted {
+  border-color: var(--copper-border);
+  background: var(--copper-surface-3);
+  color: var(--copper-text-secondary);
+}
+
+/* —— 笔记编辑区 —— */
+
+.mod-demo__editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--copper-space-2);
+}
+
+.mod-demo__input,
+.mod-demo__textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0 var(--copper-space-3);
+  border: 1px solid var(--copper-border);
+  border-radius: var(--copper-radius-md);
+  background: var(--copper-surface);
+  color: var(--copper-text);
+  font-family: var(--copper-font-family);
+  font-size: var(--copper-font-size-md);
+  transition:
+    border-color var(--copper-duration-fast) var(--copper-easing),
+    background-color var(--copper-duration-fast) var(--copper-easing);
+}
+
+.mod-demo__input {
+  height: var(--copper-control-h);
+}
+
+.mod-demo__textarea {
+  padding: var(--copper-space-2) var(--copper-space-3);
+  resize: vertical;
+  min-height: 72px;
+  line-height: 1.5;
+}
+
+.mod-demo__input:focus,
+.mod-demo__textarea:focus {
+  outline: none;
+  border-color: var(--copper-accent);
+  background: var(--copper-surface-2);
+}
+
+.mod-demo__input::placeholder,
+.mod-demo__textarea::placeholder {
+  color: var(--copper-text-disabled);
+}
+
+/* 轻量按钮：与输入框同高，用于卡片内联操作与标题栏注入按钮。 */
+.mod-demo__header-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--copper-space-2);
+  width: auto;
+  height: var(--copper-control-h-sm);
+  padding: 0 var(--copper-space-3);
+  cursor: pointer;
+  color: var(--copper-text-secondary);
+  font-size: var(--copper-font-size-sm);
+  white-space: nowrap;
+}
+
+.mod-demo__header-btn:hover:not(:disabled) {
+  border-color: var(--copper-accent);
+  color: var(--copper-text);
+  background: var(--copper-surface-3);
+}
+
+.mod-demo__header-btn:focus-visible {
+  outline: 2px solid var(--copper-accent);
+  outline-offset: 1px;
+}
+
+.mod-demo__header-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.mod-demo__editor-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--copper-space-2);
+}
+
+.mod-demo__editor-hint {
+  color: var(--copper-text-disabled);
+  font-size: var(--copper-font-size-xs);
+}
+
+/* —— 列表 —— */
+
+.mod-demo__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--copper-space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mod-demo__list-scroll {
+  max-height: 340px;
+  overflow-y: auto;
+  padding-right: var(--copper-space-1);
+}
+
+/* —— 加载骨架 —— */
+
+.mod-demo__skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--copper-space-2);
+}
+
+.mod-demo__skeleton-line {
+  height: 14px;
+  border-radius: var(--copper-radius-sm);
+  background: color-mix(in srgb, var(--copper-text-secondary) 18%, transparent);
+  animation: mod-demo-pulse 1.2s var(--copper-easing) infinite;
+}
+
+.mod-demo__skeleton-line--short {
+  width: 45%;
+}
+
+@keyframes mod-demo-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mod-demo__skeleton-line {
+    animation: none;
+  }
+}
+
+/* —— 操作反馈（按钮忙碌 / 结果）—— */
+
+.mod-demo__spinner {
+  animation: mod-demo-spin 0.9s linear infinite;
+}
+
+@keyframes mod-demo-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mod-demo__spinner {
+    animation-duration: 2.4s;
+  }
+}
+
+.mod-demo__result {
+  display: flex;
+  align-items: center;
+  gap: var(--copper-space-2);
+  padding: var(--copper-space-2) var(--copper-space-3);
+  border-radius: var(--copper-radius-md);
+  font-size: var(--copper-font-size-sm);
+  border: 1px solid var(--copper-border);
+  background: var(--copper-surface-3);
+  color: var(--copper-text);
+  animation: mod-demo-fade-in var(--copper-duration) var(--copper-easing);
+}
+
+.mod-demo__result--success {
+  border-color: color-mix(in srgb, var(--copper-success) 45%, transparent);
+  background: color-mix(in srgb, var(--copper-success) 12%, transparent);
+}
+
+.mod-demo__result--danger {
+  border-color: color-mix(in srgb, var(--copper-danger) 45%, transparent);
+  background: color-mix(in srgb, var(--copper-danger) 12%, transparent);
+}
+
+@keyframes mod-demo-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* —— 详情页 —— */
+
+.mod-demo__detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--copper-space-4);
+  max-width: 760px;
+}
+
+.mod-demo__detail-back {
+  align-self: flex-start;
+}
+
+.mod-demo__activity-time {
+  color: var(--copper-text-disabled);
+  font-size: var(--copper-font-size-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.mod-demo__footer-note {
+  color: var(--copper-text-disabled);
+  font-size: var(--copper-font-size-xs);
+  line-height: 1.5;
+}

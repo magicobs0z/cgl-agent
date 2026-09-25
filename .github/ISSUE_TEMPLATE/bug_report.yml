@@ -1,0 +1,87 @@
+name: 缺陷反馈
+description: 反馈模块的功能异常或崩溃
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请尽量填全下列信息——模块问题多数与「内核版本 / 模块版本 / 是否静态编译接入」相关，
+        缺少版本信息会让排查变得困难。
+
+  - type: input
+    id: module_version
+    attributes:
+      label: 模块版本
+      description: 取自 module.json 的 version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: launcher_version
+    attributes:
+      label: 铜傀儡（内核）版本
+      description: 设置页可见；也对应 module.json 的 launcher.min/max 区间
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台
+      options:
+        - windows-x86_64
+        - windows-aarch64
+        - android-arm64
+        - linux-x86_64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: integration
+    attributes:
+      label: 接入方式
+      description: 阶段一内核只支持静态编译的内置模块，接入方式直接影响可复现性
+      options:
+        - 源码依赖（作为 path/git 依赖编译进内核）
+        - 手动导入到 modules_dir（开发调试）
+        - 从模块列表一键安装（动态加载，内核尚未实现）
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开 ...
+        2. 点击 ...
+        3. 观察到 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 若有报错，请贴出完整错误文本与日志片段
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: 内核日志位置见 README；模块日志按模块 id 分文件
+      render: text
+    validations:
+      required: false

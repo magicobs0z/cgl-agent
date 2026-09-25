@@ -1,0 +1,26 @@
+# 依赖与构建产物
+node_modules/
+target/
+dist/
+# 前端产物目录（与 module.json 的 frontend.dist 一致）
+frontend/dist/
+dist-package/
+
+# 库 crate 不提交 Cargo.lock（本 crate 是 lib，不是 bin）。
+# 设计文档 2.2 的目录树亦未列该文件：它随依赖解析生成，提交会让每次依赖变更
+# 都产生噪声 diff，且对「clone 后即可构建」无贡献。
+src-tauri/Cargo.lock
+
+# 提审中间产物（由 module-submit workflow 生成）
+.submit/
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+npm-debug.log*

@@ -1,0 +1,44 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "skipLibCheck": true,
+
+    /* Bundler 模式：由 Vite 负责实际打包，tsc 只做类型检查。 */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "preserve",
+
+    /* 严格模式：模板是给第三方开发者的起点，宁可在编译期报错。 */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+
+    /* 模板前端会按相对路径直接引用内核的注册表与 API 封装
+       （`../../../CopperCore/frontend/src/...`），阶段一这是唯一的对接方式。
+       内核仓库自己有一份 node_modules（含它自己的 vue / vue-router），
+       若不收敛到本仓库这一份，vue 的类型会被解析出**两个不同来源**，
+       `Component` / `Slot` 等类型互不兼容，vue-tsc 会报一堆「两个同名类型不相关」。 */
+    "paths": {
+      "vue": ["./node_modules/vue"],
+      "vue-router": ["./node_modules/vue-router"],
+      "@tauri-apps/api": ["./node_modules/@tauri-apps/api"],
+      "@tauri-apps/api/*": ["./node_modules/@tauri-apps/api/*"],
+      "@lucide/vue": ["./node_modules/@lucide/vue"]
+    },
+    "types": ["vite/client"]
+  },
+  "include": [
+    "frontend/src/**/*.ts",
+    "frontend/src/**/*.d.ts",
+    "frontend/src/**/*.vue",
+    "frontend/src/**/*.json"
+  ],
+  "exclude": ["node_modules", "dist", "target"]
+}

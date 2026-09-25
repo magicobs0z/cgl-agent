@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none" role="img" aria-label="Demo Tools">
+  <!--
+    模块模板自带的占位图标：模块作者应自行替换。
+    绘制约束：单色几何形，避免渐变与位图，保证在列表页 32px 尺寸下仍可辨识；
+    配色沿用铜主题的强调色（#c97b3d），与内核视觉一致。
+  -->
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="#c97b3d" fill-opacity="0.14" stroke="#c97b3d" stroke-width="8"/>
+  <!-- 扳手与齿轮的最小可辨识组合：一个圆环 + 一个开口，表达「工具」语义 -->
+  <circle cx="112" cy="112" r="34" stroke="#c97b3d" stroke-width="14"/>
+  <path d="M138 138 L186 186" stroke="#c97b3d" stroke-width="16" stroke-linecap="round"/>
+  <circle cx="112" cy="112" r="10" fill="#c97b3d"/>
+</svg>

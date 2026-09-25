@@ -1,0 +1,90 @@
+name: module-submit
+
+# Release 正式发布后触发：校验资产齐全 -> 生成 cgl-libs 收录条目 -> 自动开 PR。
+#
+# 责任边界（见 docs/cgl-models.md 2.10.1 第六节）：
+# - bot 只填 manifest 与 Release 能唯一确定的字段；
+# - channel / status / yanked / yank_reason / author.verified 留给 cgl-libs 侧流程；
+#   icon.* 与 permissions_derived 由 cgl-libs CI 生成；
+# - 任何无法唯一确定的字段一律失败，不猜默认值（本 workflow 亦不提供任何默认值兜底）。
+#
+# 幂等：① 固定分支 module/<模块仓库名>，重复发布复用同一分支并更新既有 PR；
+#       ② 按 id 在目标分片的 modules[] 中整体替换该模块条目；
+#       ③ 内容无差异时不产生提交。
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出模块仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 安装前端依赖（提供 schema 校验所需依赖）
+        run: npm install
+
+      - name: 校验 module.json 与 Release tag 一致
+        run: node scripts/validate-manifest.mjs --expect-version "${{ github.event.release.tag_name }}"
+
+      - name: 拉取 Release 资产清单
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --json assets,publishedAt > release-assets.json
+
+      - name: 校验 Release 资产齐全（.cglm 与 .sha256 成对）
+        run: |
+          node scripts/validate-release-assets.mjs \
+            --gh-json release-assets.json \
+            --tag "${{ github.event.release.tag_name }}"
+
+      - name: 生成 cgl-libs 收录条目与 PR 正文
+        run: |
+          node scripts/build-libs-entry.mjs \
+            --tag "${{ github.event.release.tag_name }}" \
+            --assets-json release-assets.json \
+            --out .submit
+
+      - name: 检出 cgl-libs
+        uses: actions/checkout@v4
+        with:
+          repository: copper-lamp/cgl-libs
+          token: ${{ secrets.CGL_LIBS_TOKEN }}
+          path: cgl-libs
+
+      - name: 写入条目到目标分片（按 id 整体替换）
+        run: node scripts/merge-libs-entry.mjs --entry .submit/entry.json --shard-file ".submit/shard.txt" --libs cgl-libs
+
+      - name: 开 PR（幂等：同分支已存在 PR 则更新）
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: cgl-libs
+          token: ${{ secrets.CGL_LIBS_TOKEN }}
+          branch: module/${{ github.event.repository.name }}
+          base: main
+          delete-branch: true
+          commit-message: "Add module entry: ${{ github.event.repository.name }} ${{ github.event.release.tag_name }}"
+          title: "[module] ${{ github.event.repository.name }} ${{ github.event.release.tag_name }}"
+          body-path: .submit/pr-body.md
+          labels: module-submission
+
+      - name: 上传条目产物（审核留档）
+        uses: actions/upload-artifact@v4
+        with:
+          name: libs-entry
+          path: .submit/*
+          if-no-files-found: error

@@ -1,0 +1,126 @@
+name: module-package
+
+# tag 触发：校验版本一致 -> 按平台矩阵构建 -> 打包 -> sha256 -> 上传 Release 资产。
+#
+# 分发形态的阶段性说明（见 docs/cgl-models.md 2.9）：
+# - 阶段一（当前可行）：产物为**源码依赖形态**的分发包，供开发者/使用者自行编译，
+#   不进入面向终端用户的一键安装链路（内核尚无附加模块装载器）。
+# - 阶段二：内核支持动态加载后，同一份包结构即为二进制分发形态，契约无需改动。
+#
+# 产物格式：`.cglm`（zip 容器）；每个 `.cglm` 附一个同名 `.sha256`。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（须与 module.json 的 version 一致）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出模块仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 安装前端依赖
+        run: npm install
+
+      - name: 校验 module.json 与 tag 一致
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          node scripts/validate-manifest.mjs --expect-version "$VERSION"
+
+      - name: 校验语言包键集一致
+        run: node scripts/validate-manifest.mjs --check-locales
+
+  package:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            os: windows-latest
+            backend_glob: target/release/copper_module_demo.dll
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: 检出模块仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装前端依赖
+        run: npm install
+
+      - name: 构建前端
+        run: npm run build:frontend
+
+      - name: 构建后端（release）
+        run: cargo build --release --manifest-path src-tauri/Cargo.toml
+
+      - name: 生成发布包与 sha256
+        shell: pwsh
+        run: |
+          node scripts/package-module.mjs `
+            --platform "${{ matrix.platform }}" `
+            --backend "${{ matrix.backend_glob }}" `
+            --out dist-package
+
+      - name: 校验发布包可与校验文件配对
+        shell: pwsh
+        run: |
+          node scripts/validate-release-assets.mjs `
+            --dir dist-package `
+            --assets "copper-lamp.demo-tools-$(node -p "require('./module.json').version")-${{ matrix.platform }}.cglm,copper-lamp.demo-tools-$(node -p "require('./module.json').version")-${{ matrix.platform }}.cglm.sha256"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-${{ matrix.platform }}
+          path: dist-package/*
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 下载全部平台构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-package
+          merge-multiple: true
+
+      - name: 上传到 Release 资产
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-package/*.cglm
+            dist-package/*.cglm.sha256
+          draft: false
+          generate_release_notes: false

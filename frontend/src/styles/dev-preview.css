@@ -1,0 +1,48 @@
+/* dev 独立预览宿主样式：仅 `npm run dev` 使用，不进发布包。
+ *
+ * 为什么单独一份：预览宿主不是内核 Shell，没有标题栏与左导航，
+ * 但模块页面本身假设自己处在 Shell 的内容区里（有内边距、有高度约束）。
+ * 这里补上等价的最小布局，使预览下的排版与内核内基本一致，
+ * 避免出现「预览好看、进内核就挤在一起」这类只在真机上才暴露的落差。
+ *
+ * 令牌约定：仅消费 var(--copper-*)，禁止颜色字面量（与 module.css 同规则）。 */
+
+.dev-preview {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background: var(--copper-bg);
+  color: var(--copper-text);
+  font-family: var(--copper-font-family);
+  font-size: var(--copper-font-size-md);
+}
+
+/* 标题条：等价于内核 Shell 的标题栏，仅用于预览期说明当前页面归属 */
+.dev-preview__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--copper-space-3);
+  height: var(--copper-titlebar-h);
+  padding: 0 var(--copper-space-4);
+  border-bottom: 1px solid var(--copper-border);
+  background: var(--copper-surface);
+  flex: 0 0 auto;
+}
+
+.dev-preview__brand {
+  font-weight: 600;
+  color: var(--copper-text);
+}
+
+.dev-preview__hint {
+  color: var(--copper-text-secondary);
+  font-size: var(--copper-font-size-sm);
+}
+
+/* 内容区：留出与内核内容区一致的内边距 */
+.dev-preview__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--copper-space-5);
+}
