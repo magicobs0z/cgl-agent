@@ -24,7 +24,7 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { basename, join, posix, resolve, sep } from "node:path";
+import { basename, dirname, join, posix, resolve, sep } from "node:path";
 
 import {
   BACKEND_EXT_BY_PLATFORM,
@@ -163,7 +163,7 @@ function crc32(buf) {
 // ---------------------------------------------------------------- 打包
 
 /** 递归收集待入包文件：返回 [{ zipPath, absPath }]。 */
-function collectEntries({ manifest, backendPath, platform, frontendDist }) {
+function collectEntries({ manifest, backendPath, platform, frontendDist, runtimeDir }) {
   const entries = [];
 
   // 1. 清单本体：与仓库根同名文件一致，随包分发。
@@ -200,6 +200,33 @@ function collectEntries({ manifest, backendPath, platform, frontendDist }) {
       absPath: join(frontendDist, rel.replace(/\//g, sep)),
       required: true,
     });
+  }
+
+  // 6. 受监管运行时入口：清单声明 runtime 时，把该目录整目录搬进包内同名目录。
+  //    它是构建产物（已在 .gitignore 中），所以这里必须把「没构建」变成打包期失败——
+  //    否则会打出一个直到内核装载时才报错的包，而那时用户已经下载安装了。
+  if (manifest.runtime) {
+    if (!isNonEmptyDir(runtimeDir)) {
+      fail(
+        `运行时产物目录为空或不存在：${displayPath(runtimeDir)}（请先执行 npm run build:runtime）`,
+      );
+    }
+    const runtimeFiles = listFilesRecursive(runtimeDir);
+    for (const rel of runtimeFiles) {
+      entries.push({
+        zipPath: posix.join("runtime", rel),
+        absPath: join(runtimeDir, rel.replace(/\//g, sep)),
+        required: true,
+      });
+    }
+    // 声明的入口必须真的在包内：写错路径要在打包期失败，而不是等内核拒绝装载。
+    const declaredEntry = manifest.runtime.entry;
+    if (!runtimeFiles.some((rel) => posix.join("runtime", rel) === declaredEntry)) {
+      fail(
+        `module.json 的 runtime.entry「${declaredEntry}」不在运行时产物目录内，` +
+          `实际包含：${runtimeFiles.join(", ")}`,
+      );
+    }
   }
 
   return entries;
@@ -281,10 +308,16 @@ async function main() {
   const frontendDist = frontendArg
     ? resolve(REPO_ROOT, frontendArg)
     : resolve(REPO_ROOT, manifest.frontend.dist);
+  // `--runtime` 覆盖运行时产物目录，默认取 module.json 的 runtime.entry 所在目录。
+  // 与 `--frontend` 同为可测性入口：结构门禁用例要在不依赖真实构建产物的情况下执行。
+  const runtimeDir = resolve(
+    REPO_ROOT,
+    args.get("runtime", manifest.runtime ? dirname(manifest.runtime.entry) : "runtime"),
+  );
   const outDir = resolve(REPO_ROOT, args.get("out", "dist-package"));
 
   const assetName = packageFileName(manifest, platform);
-  const entries = collectEntries({ manifest, backendPath, platform, frontendDist });
+  const entries = collectEntries({ manifest, backendPath, platform, frontendDist, runtimeDir });
   const problems = verifyEntries(entries, manifest, platform);
 
   info(`模块：${manifest.id}@${manifest.version}  平台：${platform}`);

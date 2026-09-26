@@ -28,7 +28,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { posix } from "node:path";
 
 import {
@@ -92,13 +92,18 @@ function run(cmd, cmdArgs) {
 }
 
 /** 构建前端与后端（可跳过，便于只重同步）。 */
-function build({ skipBuild }) {
+function build({ skipBuild, manifest }) {
   if (skipBuild) {
     info("跳过构建（--skip-build）");
     return;
   }
   run(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build:frontend"]);
   run("cargo", ["build", "--release", "--manifest-path", "src-tauri/Cargo.toml"]);
+  // 受监管运行时入口是构建产物（.gitignore 掉的那份），声明了 runtime 就必须产出，
+  // 否则内核会在装载期直接拒绝——在同步期报错比装好后报错更省事。
+  if (manifest.runtime) {
+    run(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build:runtime"]);
+  }
 }
 
 /** 解析后端产物路径：按当前平台从 manifest 的 artifact_glob 推导。 */
@@ -128,7 +133,7 @@ function syncOnce() {
     fail(`平台 ${platform} 不在 module.json.platforms 内，拒绝同步（声明与产物必须自洽）`);
   }
 
-  build({ skipBuild: args.has("skip-build") });
+  build({ skipBuild: args.has("skip-build"), manifest });
 
   const targetDir = assertInsideRoot(join(modulesDir, manifest.id), modulesDir);
   const frontendDist = resolve(REPO_ROOT, manifest.frontend.dist);
@@ -140,6 +145,12 @@ function syncOnce() {
   if (!existsSync(backendArtifact)) {
     fail(`后端产物不存在：${displayPath(backendArtifact)}（先执行 npm run build:backend）`);
   }
+  // 声明了 runtime 就同步运行时入口目录：内核按 `runtime/` 下的 entry 派生受监管会话，
+  // 少了它模块会被直接判为不可装载。
+  const runtimeDir = manifest.runtime ? resolve(REPO_ROOT, dirname(manifest.runtime.entry)) : null;
+  if (runtimeDir && !isNonEmptyDir(runtimeDir)) {
+    fail(`运行时产物为空：${displayPath(runtimeDir)}（先执行 npm run build:runtime）`);
+  }
 
   // 原子替换：先落到同级的临时目录，再整目录换名，避免半成品目录被内核读到。
   const staging = `${targetDir}.staging`;
@@ -149,6 +160,7 @@ function syncOnce() {
   copyDir(frontendDist, join(staging, "frontend"));
   mkdirSync(join(staging, "backend"), { recursive: true });
   cpSync(backendArtifact, join(staging, "backend", backendArtifact.split(sep).pop()));
+  if (runtimeDir) copyDir(runtimeDir, join(staging, "runtime"));
   cpSync(join(REPO_ROOT, "module.json"), join(staging, "module.json"));
   cpSync(join(REPO_ROOT, manifest.icon), join(staging, manifest.icon.split(sep).pop()));
 

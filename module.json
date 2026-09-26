@@ -1,5 +1,5 @@
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "id": "copper-lamp.demo-tools",
   "i18n_namespace": "demo-tools",
   "display_name": "示例工具",
@@ -15,13 +15,19 @@
   "version": "0.1.0",
   "platforms": ["windows-x86_64"],
   "launcher": { "min": "0.1.0", "max": null },
-  "api_version": 1,
+  "api_version": 2,
   "backend": {
     "crate": "copper-module-demo",
     "entry": "copper_module_demo::DemoModule",
     "artifact_glob": "src-tauri/target/release/copper_module_demo.dll"
   },
   "frontend": { "dist": "frontend/dist", "register": "register.js" },
+  "runtime": {
+    "kind": "node",
+    "entry": "runtime/pi-session.mjs",
+    "engines": { "node": ">=22.19.0" },
+    "wire_protocol": { "id": "copper-addon.ndjson", "version": 2 }
+  },
   "permissions": ["intents:request"],
   "events": { "subscribe": ["download.status"], "publish": ["demo-tools.activity"] },
   "intents": ["demo-tools.ping"],

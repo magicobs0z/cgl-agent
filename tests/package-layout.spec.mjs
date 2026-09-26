@@ -46,7 +46,13 @@ function makeArtifactFixture() {
   // 后端产物：打包器只校验存在与非空，不看真实 ELF/PE 结构。
   const backend = join(root, "copper_module_demo.dll");
   writeFileSync(backend, "fixture-backend\n");
-  return [frontendDir, backend];
+  // 运行时产物：清单声明 runtime 时打包器要求它存在，且必须包含声明的 entry。
+  // 真实产物是 `runtime/pi-session.mjs`（.gitignore 的构建产物），这里用同名夹具文件，
+  // 让这条门禁同样不依赖本机是否跑过 `npm run build:runtime`。
+  const runtimeDir = join(root, "runtime");
+  mkdirSync(runtimeDir, { recursive: true });
+  writeFileSync(join(runtimeDir, "pi-session.mjs"), "// fixture runtime\n");
+  return [frontendDir, backend, runtimeDir];
 }
 
 /** 从 zip 字节解析中央目录，返回条目名列表（只读结构，不依赖解压库）。 */
@@ -91,7 +97,7 @@ function readZipEntry(buf, entryName) {
 
 test("package-module.mjs --plan-only 通过结构门禁", () => {
   // 用夹具而非真实产物：门禁本身必须无条件执行，否则未构建的机器上这条覆盖会消失。
-  const [frontendDir, backend] = makeArtifactFixture();
+  const [frontendDir, backend, runtimeDir] = makeArtifactFixture();
   try {
     const out = execFileSync(
       process.execPath,
@@ -103,6 +109,8 @@ test("package-module.mjs --plan-only 通过结构门禁", () => {
         backend,
         "--frontend",
         frontendDir,
+        "--runtime",
+        runtimeDir,
         "--plan-only",
       ],
       { cwd: REPO_ROOT, encoding: "utf8" },
@@ -110,6 +118,8 @@ test("package-module.mjs --plan-only 通过结构门禁", () => {
     assert.match(out, /module\.json/);
     assert.match(out, /backend\//);
     assert.match(out, /frontend\/register\.js/);
+    // 声明了 runtime 就必须带上受监管运行时入口，否则内核装载期会直接拒绝。
+    assert.match(out, /runtime\/pi-session\.mjs/);
   } finally {
     rmSync(dirname(frontendDir), { recursive: true, force: true });
   }
@@ -118,7 +128,7 @@ test("package-module.mjs --plan-only 通过结构门禁", () => {
 test("发布包内部布局与校验清单符合契约", { skip: planOnly ? "plan-only 模式跳过实包校验" : false }, () => {
   // 同样用夹具：这条用例守的是发布包结构契约，必须无条件执行，
   // 不能因为「本机没构建过后端」就静默失去覆盖。
-  const [frontendDir, backend] = makeArtifactFixture();
+  const [frontendDir, backend, runtimeDir] = makeArtifactFixture();
   const work = mkdtempSync(join(tmpdir(), "cglm-pkg-"));
   try {
     execFileSync(
@@ -131,6 +141,8 @@ test("发布包内部布局与校验清单符合契约", { skip: planOnly ? "pla
         backend,
         "--frontend",
         frontendDir,
+        "--runtime",
+        runtimeDir,
         "--out",
         work,
       ],
@@ -163,6 +175,14 @@ test("发布包内部布局与校验清单符合契约", { skip: planOnly ? "pla
       names.some((n) => n.startsWith("backend/") && n.endsWith(".dll")),
       "包内缺少 backend/*.dll",
     );
+    // 声明 runtime 的模块必须把运行时入口打进包，且路径与清单声明逐字一致
+    // （内核按 runtime.entry 在包内定位入口）。
+    if (manifest.runtime) {
+      assert.ok(
+        names.includes(manifest.runtime.entry),
+        `包内缺少清单声明的运行时入口 ${manifest.runtime.entry}，实际：${names.join(", ")}`,
+      );
+    }
 
     // 包内清单必须逐文件覆盖（自身除外）。
     const inner = readZipEntry(buf, "manifest.sha256").toString("utf8");
