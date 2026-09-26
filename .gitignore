@@ -6,6 +6,13 @@ dist/
 frontend/dist/
 dist-package/
 
+# 受监管 Node 运行时的构建产物：由 scripts/build-agent-runtime.mjs 从 vendor/pi 打包生成，
+# 不提交（源码在 agent-session/，上游依赖在 vendor/pi/）。与 frontend/dist 同理：
+# 提交产物会让「构建是否可复现」无从判断。
+runtime/
+# vendored Pi 的第三方依赖：由 npm run vendor:install 按 vendor/pi 的 lock 还原。
+vendor/pi/node_modules/
+
 # 库 crate 不提交 Cargo.lock（本 crate 是 lib，不是 bin）。
 # 设计文档 2.2 的目录树亦未列该文件：它随依赖解析生成，提交会让每次依赖变更
 # 都产生噪声 diff，且对「clone 后即可构建」无贡献。

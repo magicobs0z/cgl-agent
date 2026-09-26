@@ -26,8 +26,8 @@
   "properties": {
     "schema_version": {
       "type": "string",
-      "enum": ["1"],
-      "description": "清单格式版本。新增必填字段时递增，内核按此判定兼容。"
+      "enum": ["1", "2"],
+      "description": "清单格式版本。新增必填字段时递增，内核按此判定兼容。v2 起支持可选的 `runtime` 声明；v1 清单仍原样可用。"
     },
     "id": {
       "type": "string",
@@ -107,8 +107,8 @@
     },
     "api_version": {
       "type": "integer",
-      "minimum": 1,
-      "description": "模块 API 版本，值须与内核当前支持的版本一致，否则内核拒绝装载。"
+      "enum": [1, 2],
+      "description": "模块 API 版本。1 = 基础契约；2 = 允许声明 `runtime`（内核派生并监管的模块专属运行时会话）。值须在内核当前支持的集合内，否则内核拒绝装载。"
     },
     "backend": {
       "type": "object",
@@ -130,6 +130,37 @@
         "register": { "type": "string", "pattern": "^[A-Za-z0-9._-]+\\.js$" }
       },
       "description": "前端产物声明：dist 为构建目录，register 为注册入口的编译后模块名。"
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "entry", "engines"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["node"],
+          "description": "运行时种类。当前仅支持 node。"
+        },
+        "entry": {
+          "type": "string",
+          "pattern": "^runtime/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$",
+          "description": "入口脚本的包内相对路径，必须位于 runtime/ 子目录内。该目录是发布包中唯一可被内核执行的代码位置。安全关键规则（拒绝 `..` 穿越、绝对路径、盘符）由内核执行，本 pattern 只拦常见笔误。"
+        },
+        "engines": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["node"],
+          "properties": {
+            "node": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Node 的 semver 区间（如 \">=22.19.0\"）。运行时使用系统已安装的 Node，不随包分发也不自动下载；不满足即拒绝启动。"
+            }
+          },
+          "description": "解释器版本要求。"
+        }
+      },
+      "description": "受监管运行时声明（可选）。一旦声明，内核负责定位运行时、校验版本、派生并监管会话；模块自身不启动进程，也不申请 `process:spawn`。声明它的清单必须把 schema_version 升到 \"2\" 且 api_version 升到 2。"
     },
     "permissions": {
       "type": "array",

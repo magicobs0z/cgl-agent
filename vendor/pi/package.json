@@ -1,0 +1,16 @@
+{
+  "name": "pi-vendor",
+  "private": true,
+  "version": "0.87.1",
+  "type": "module",
+  "description": "earendil-works/pi v0.87.1 的裁剪副本：只保留 cgl-agent 运行期真正需要的包。上游源码原样保留，本目录不产出可发布的 npm 包。详见 README.md。",
+  "workspaces": [
+    "packages/agent",
+    "packages/ai",
+    "packages/telemetry",
+    "packages/chord"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

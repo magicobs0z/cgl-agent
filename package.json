@@ -1,33 +1,37 @@
 {
-  "name": "copper-module-demo",
-  "private": true,
-  "version": "0.1.0",
-  "type": "module",
-  "description": "cgl-models 模块模板：附加模块的骨架、打包与提审脚本入口。模块自身版本号的唯一数据源是 module.json。",
-  "scripts": {
-    "dev": "vite --config vite.config.ts",
-    "build:frontend": "vue-tsc --noEmit -p tsconfig.json && vite build --config vite.config.ts",
-    "build:backend": "cargo build --release --manifest-path src-tauri/Cargo.toml",
-    "build": "npm run build:frontend",
-    "package": "node scripts/package-module.mjs",
-    "submit": "node scripts/build-libs-entry.mjs --dry-run --dir dist-package",
-    "check:release": "node scripts/validate-release-assets.mjs",
-    "import:dev": "node scripts/import-dev-module.mjs",
-    "import:dev:watch": "node scripts/import-dev-module.mjs --watch",
-    "schema:check": "node scripts/validate-manifest.mjs --check-locales",
-    "test": "node --test tests/*.spec.mjs"
-  },
-  "dependencies": {
-    "@lucide/vue": "^1.41.0",
-    "@tauri-apps/api": "^2",
-    "vue": "^3.5.13",
-    "vue-router": "^4.6.4"
-  },
-  "devDependencies": {
-    "@vitejs/plugin-vue": "^6.0.7",
-    "ajv": "^8.17.1",
-    "typescript": "~6.0.3",
-    "vite": "^8.0.16",
-    "vue-tsc": "^3.3.5"
-  }
+	"name": "copper-module-demo",
+	"private": true,
+	"version": "0.1.0",
+	"type": "module",
+	"description": "cgl-models 模块模板：附加模块的骨架、打包与提审脚本入口。模块自身版本号的唯一数据源是 module.json。",
+	"scripts": {
+		"dev": "vite --config vite.config.ts",
+		"build:frontend": "vue-tsc --noEmit -p tsconfig.json && vite build --config vite.config.ts",
+		"build:backend": "cargo build --release --manifest-path src-tauri/Cargo.toml",
+		"vendor:install": "npm install --prefix vendor/pi",
+		"build:runtime": "node scripts/build-agent-runtime.mjs",
+		"build": "npm run build:frontend && npm run build:runtime",
+		"package": "node scripts/package-module.mjs",
+		"submit": "node scripts/build-libs-entry.mjs --dry-run --dir dist-package",
+		"check:release": "node scripts/validate-release-assets.mjs",
+		"import:dev": "node scripts/import-dev-module.mjs",
+		"import:dev:watch": "node scripts/import-dev-module.mjs --watch",
+		"schema:check": "node scripts/validate-manifest.mjs --check-locales",
+		"test": "node --test tests/*.spec.mjs",
+		"test:runtime": "npm run build:runtime && node agent-session/test/offline-session.mjs"
+	},
+	"dependencies": {
+		"@lucide/vue": "^1.41.0",
+		"@tauri-apps/api": "^2",
+		"vue": "^3.5.13",
+		"vue-router": "^4.6.4"
+	},
+	"devDependencies": {
+		"@vitejs/plugin-vue": "^6.0.7",
+		"ajv": "^8.17.1",
+		"esbuild": "0.28.2",
+		"typescript": "~6.0.3",
+		"vite": "^8.0.16",
+		"vue-tsc": "^3.3.5"
+	}
 }
