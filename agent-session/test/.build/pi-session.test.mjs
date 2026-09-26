@@ -689,10 +689,11 @@ var require_src = __commonJS({
 });
 
 // agent-session/src/protocol.ts
-var PROTOCOL_VERSION = 1;
+var WIRE_PROTOCOL_ID = "copper-addon.ndjson";
+var PROTOCOL_VERSION = 2;
 var SUPPORTED_PROTOCOL_VERSIONS = [PROTOCOL_VERSION];
 var LIMITS = {
-  /** 单帧入站上限。超限的行被丢弃并回报 `too_large`，不终止会话。 */
+  /** 单帧入站上限。它是统一协议的更严格实现（协议硬上限为 8 MiB）。 */
   maxInboundFrameBytes: 1024 * 1024,
   /** 单帧出站上限。超限的出站事件会被替换为 `outbound_too_large` 错误事件。 */
   maxOutboundFrameBytes: 256 * 1024,
@@ -708,15 +709,17 @@ var LIMITS = {
 var ERROR_CODES = [
   /** 帧不是合法 JSON、或字段类型/必填项不符。 */
   "bad_frame",
-  /** 帧类型未知。 */
+  /** 帧类别未知或方向错误（本方向不接受该 kind）。 */
   "unknown_type",
+  /** 方法名未在本运行时注册。 */
+  "method_not_found",
   /** 帧超过入站上限。 */
   "too_large",
   /** 出站帧超过上限（发生在事件帧上）。 */
   "outbound_too_large",
   /** 协议版本不相交。 */
   "unsupported_version",
-  /** 尚未完成 `hello` 握手就发命令。 */
+  /** 尚未完成 `hello` 握手就发业务帧。 */
   "not_initialized",
   /** 重复握手。 */
   "already_initialized",
@@ -734,6 +737,17 @@ var ERROR_CODES = [
   "shutting_down"
 ];
 var ERROR_CODE_SET = new Set(ERROR_CODES);
+var AGENT_METHODS = {
+  credentialsSet: "agent.credentials.set",
+  credentialsClear: "agent.credentials.clear",
+  modelSet: "agent.model.set",
+  sessionLoad: "agent.session.load",
+  prompt: "agent.prompt",
+  cancel: "agent.cancel",
+  ping: "agent.ping",
+  shutdown: "agent.shutdown"
+};
+var AGENT_RUN_EVENT = "agent.run";
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -746,34 +760,83 @@ function isFiniteNumber(value) {
 function isPositiveInt(value) {
   return isFiniteNumber(value) && Number.isInteger(value) && value > 0;
 }
-function extractId(record) {
-  const id = record["id"];
-  return typeof id === "string" && id.length > 0 ? id : void 0;
+function fatal(code, message) {
+  return { ok: false, kind: "fatal", error: { code, message } };
 }
-function bad(code, message, id) {
-  return id === void 0 ? { ok: false, code, message } : { ok: false, code, message, id };
+function parseHostFrame(line) {
+  let value;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return fatal("bad_frame", "\u5E27\u4E0D\u662F\u5408\u6CD5 JSON");
+  }
+  if (!isRecord(value)) return fatal("bad_frame", "\u5E27\u5FC5\u987B\u662F JSON \u5BF9\u8C61");
+  const version = value["version"];
+  if (!isFiniteNumber(version) || !Number.isInteger(version)) return fatal("bad_frame", "\u5E27\u7F3A\u5C11\u6574\u6570\u5B57\u6BB5 version");
+  if (version !== PROTOCOL_VERSION) {
+    return fatal(
+      "unsupported_version",
+      `\u534F\u8BAE\u7248\u672C\u4E0D\u76F8\u4EA4\uFF1A\u6536\u5230 v${version}\uFF0C\u672C\u8FD0\u884C\u65F6\u652F\u6301 [${SUPPORTED_PROTOCOL_VERSIONS.join(", ")}]`
+    );
+  }
+  const kind = value["kind"];
+  if (typeof kind !== "string") return fatal("bad_frame", "\u5E27\u7F3A\u5C11\u5B57\u7B26\u4E32\u5B57\u6BB5 kind");
+  if (kind === "hello") {
+    const protocol = value["protocol"];
+    if (protocol !== WIRE_PROTOCOL_ID) return fatal("bad_frame", `hello.protocol \u5FC5\u987B\u662F ${WIRE_PROTOCOL_ID}`);
+    const versions = value["supported_versions"];
+    if (!Array.isArray(versions) || versions.some((entry) => !isFiniteNumber(entry) || !Number.isInteger(entry)))
+      return fatal("bad_frame", "hello.supported_versions \u5FC5\u987B\u662F\u6574\u6570\u6570\u7EC4");
+    if (!nonEmptyString(value["runtime"])) return fatal("bad_frame", "hello.runtime \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+    const capabilities = value["capabilities"];
+    if (!Array.isArray(capabilities) || capabilities.some((entry) => typeof entry !== "string"))
+      return fatal("bad_frame", "hello.capabilities \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\u6570\u7EC4");
+    return {
+      ok: true,
+      frame: {
+        kind: "hello",
+        version,
+        protocol,
+        supported_versions: versions,
+        runtime: value["runtime"],
+        capabilities
+      }
+    };
+  }
+  if (kind === "request") {
+    const id = value["id"];
+    if (!nonEmptyString(id)) return fatal("bad_frame", "request.id \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+    const method = value["method"];
+    if (!nonEmptyString(method)) return fatal("bad_frame", "request.method \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+    if (!("params" in value)) return fatal("bad_frame", "request \u7F3A\u5C11 params \u5B57\u6BB5");
+    return { ok: true, frame: { kind: "request", version, id, method, params: value["params"] } };
+  }
+  if (kind === "response" || kind === "event" || kind === "notification" || kind === "fatal") {
+    return fatal("unknown_type", `\u672C\u65B9\u5411\u4E0D\u63A5\u53D7 ${kind} \u5E27`);
+  }
+  return fatal("unknown_type", `\u672A\u77E5\u5E27\u7C7B\u522B\uFF1A${kind}`);
 }
-function parseModelDescriptor(value, id) {
-  if (!isRecord(value)) return bad("bad_frame", "model.set.model \u5FC5\u987B\u662F\u5BF9\u8C61", id);
+function parseModelDescriptor(value) {
+  const invalid = (message) => ({ ok: false, error: { code: "bad_frame", message } });
+  if (!isRecord(value)) return invalid("model.set.model \u5FC5\u987B\u662F\u5BF9\u8C61");
   const { provider, api, baseUrl, model } = value;
-  if (!nonEmptyString(provider)) return bad("bad_frame", "model.set.model.provider \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32", id);
-  if (!nonEmptyString(api)) return bad("bad_frame", "model.set.model.api \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32", id);
-  if (!nonEmptyString(baseUrl)) return bad("bad_frame", "model.set.model.baseUrl \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32", id);
-  if (!isRecord(model)) return bad("bad_frame", "model.set.model.model \u5FC5\u987B\u662F\u5BF9\u8C61", id);
-  if (!nonEmptyString(model["id"])) return bad("bad_frame", "model.set.model.model.id \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32", id);
-  if (!isPositiveInt(model["contextWindow"]))
-    return bad("bad_frame", "model.set.model.model.contextWindow \u5FC5\u987B\u662F\u6B63\u6574\u6570", id);
-  if (!isPositiveInt(model["maxTokens"])) return bad("bad_frame", "model.set.model.model.maxTokens \u5FC5\u987B\u662F\u6B63\u6574\u6570", id);
+  if (!nonEmptyString(provider)) return invalid("model.set.model.provider \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+  if (!nonEmptyString(api)) return invalid("model.set.model.api \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+  if (!nonEmptyString(baseUrl)) return invalid("model.set.model.baseUrl \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+  if (!isRecord(model)) return invalid("model.set.model.model \u5FC5\u987B\u662F\u5BF9\u8C61");
+  if (!nonEmptyString(model["id"])) return invalid("model.set.model.model.id \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+  if (!isPositiveInt(model["contextWindow"])) return invalid("model.set.model.model.contextWindow \u5FC5\u987B\u662F\u6B63\u6574\u6570");
+  if (!isPositiveInt(model["maxTokens"])) return invalid("model.set.model.model.maxTokens \u5FC5\u987B\u662F\u6B63\u6574\u6570");
   const name = model["name"];
-  if (name !== void 0 && typeof name !== "string") return bad("bad_frame", "model.set.model.model.name \u5FC5\u987B\u662F\u5B57\u7B26\u4E32", id);
+  if (name !== void 0 && typeof name !== "string") return invalid("model.set.model.model.name \u5FC5\u987B\u662F\u5B57\u7B26\u4E32");
   const reasoning = model["reasoning"];
   if (reasoning !== void 0 && typeof reasoning !== "boolean")
-    return bad("bad_frame", "model.set.model.model.reasoning \u5FC5\u987B\u662F\u5E03\u5C14\u503C", id);
+    return invalid("model.set.model.model.reasoning \u5FC5\u987B\u662F\u5E03\u5C14\u503C");
   const rawInput = model["input"];
   let input;
   if (rawInput !== void 0) {
     if (!Array.isArray(rawInput) || rawInput.some((entry) => entry !== "text" && entry !== "image"))
-      return bad("bad_frame", 'model.set.model.model.input \u53EA\u80FD\u662F "text"/"image" \u6570\u7EC4', id);
+      return invalid('model.set.model.model.input \u53EA\u80FD\u662F "text"/"image" \u6570\u7EC4');
     input = rawInput;
   }
   return {
@@ -793,108 +856,85 @@ function parseModelDescriptor(value, id) {
     }
   };
 }
-function parseHostFrame(line) {
-  let value;
-  try {
-    value = JSON.parse(line);
-  } catch {
-    return bad("bad_frame", "\u5E27\u4E0D\u662F\u5408\u6CD5 JSON");
-  }
-  if (!isRecord(value)) return bad("bad_frame", "\u5E27\u5FC5\u987B\u662F JSON \u5BF9\u8C61");
-  const id = extractId(value);
-  const type = value["type"];
-  if (typeof type !== "string") return bad("bad_frame", "\u5E27\u7F3A\u5C11\u5B57\u7B26\u4E32\u5B57\u6BB5 type", id);
-  switch (type) {
-    case "hello": {
-      const versions = value["protocolVersions"];
-      if (!Array.isArray(versions) || versions.some((entry) => !isFiniteNumber(entry) || !Number.isInteger(entry)))
-        return bad("bad_frame", "hello.protocolVersions \u5FC5\u987B\u662F\u6574\u6570\u6570\u7EC4", id);
-      const host = value["host"];
-      if (!isRecord(host) || !nonEmptyString(host["name"]) || !nonEmptyString(host["version"]))
-        return bad("bad_frame", "hello.host \u5FC5\u987B\u542B name/version", id);
+function parseAgentRequest(frame) {
+  const params = frame.params;
+  const id = frame.id;
+  const invalid = (code, message) => ({ ok: false, error: { code, message } });
+  switch (frame.method) {
+    case AGENT_METHODS.credentialsSet: {
+      if (!isRecord(params)) return invalid("bad_frame", "credentials.set \u53C2\u6570\u5FC5\u987B\u662F\u5BF9\u8C61");
+      if (!nonEmptyString(params["credentialId"]))
+        return invalid("bad_frame", "credentials.set.credentialId \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+      if (!nonEmptyString(params["provider"])) return invalid("bad_frame", "credentials.set.provider \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+      if (!nonEmptyString(params["apiKey"])) return invalid("bad_frame", "credentials.set.apiKey \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
       return {
         ok: true,
-        frame: {
-          type: "hello",
-          id: id ?? "",
-          protocolVersions: versions,
-          host: { name: host["name"], version: host["version"] }
-        }
-      };
-    }
-    case "credentials.set": {
-      if (id === void 0) return bad("bad_frame", "credentials.set \u7F3A\u5C11 id");
-      if (!nonEmptyString(value["credentialId"]))
-        return bad("bad_frame", "credentials.set.credentialId \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32", id);
-      if (!nonEmptyString(value["provider"])) return bad("bad_frame", "credentials.set.provider \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32", id);
-      if (!nonEmptyString(value["apiKey"])) return bad("bad_frame", "credentials.set.apiKey \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32", id);
-      return {
-        ok: true,
-        frame: {
-          type: "credentials.set",
+        request: {
           id,
-          credentialId: value["credentialId"],
-          provider: value["provider"],
-          apiKey: value["apiKey"]
+          method: AGENT_METHODS.credentialsSet,
+          params: {
+            credentialId: params["credentialId"],
+            provider: params["provider"],
+            apiKey: params["apiKey"]
+          }
         }
       };
     }
-    case "credentials.clear": {
-      if (id === void 0) return bad("bad_frame", "credentials.clear \u7F3A\u5C11 id");
-      if (!nonEmptyString(value["provider"])) return bad("bad_frame", "credentials.clear.provider \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32", id);
-      return { ok: true, frame: { type: "credentials.clear", id, provider: value["provider"] } };
+    case AGENT_METHODS.credentialsClear: {
+      if (!isRecord(params)) return invalid("bad_frame", "credentials.clear \u53C2\u6570\u5FC5\u987B\u662F\u5BF9\u8C61");
+      if (!nonEmptyString(params["provider"])) return invalid("bad_frame", "credentials.clear.provider \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+      return { ok: true, request: { id, method: AGENT_METHODS.credentialsClear, params: { provider: params["provider"] } } };
     }
-    case "model.set": {
-      if (id === void 0) return bad("bad_frame", "model.set \u7F3A\u5C11 id");
-      const parsed = parseModelDescriptor(value["model"], id);
-      if (!parsed.ok) return parsed;
-      return { ok: true, frame: { type: "model.set", id, model: parsed.model } };
+    case AGENT_METHODS.modelSet: {
+      if (!isRecord(params)) return invalid("bad_frame", "model.set \u53C2\u6570\u5FC5\u987B\u662F\u5BF9\u8C61");
+      const parsed = parseModelDescriptor(params["model"]);
+      if (!parsed.ok) return { ok: false, error: parsed.error };
+      return { ok: true, request: { id, method: AGENT_METHODS.modelSet, params: { model: parsed.model } } };
     }
-    case "session.load": {
-      if (id === void 0) return bad("bad_frame", "session.load \u7F3A\u5C11 id");
-      if (!nonEmptyString(value["sessionId"])) return bad("bad_frame", "session.load.sessionId \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32", id);
-      const rawMessages = value["messages"];
-      if (!Array.isArray(rawMessages)) return bad("bad_frame", "session.load.messages \u5FC5\u987B\u662F\u6570\u7EC4", id);
+    case AGENT_METHODS.sessionLoad: {
+      if (!isRecord(params)) return invalid("bad_frame", "session.load \u53C2\u6570\u5FC5\u987B\u662F\u5BF9\u8C61");
+      if (!nonEmptyString(params["sessionId"])) return invalid("bad_frame", "session.load.sessionId \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+      const rawMessages = params["messages"];
+      if (!Array.isArray(rawMessages)) return invalid("bad_frame", "session.load.messages \u5FC5\u987B\u662F\u6570\u7EC4");
       if (rawMessages.length > LIMITS.maxSeedMessages)
-        return bad("bad_request", `session.load.messages \u8D85\u8FC7 ${LIMITS.maxSeedMessages} \u6761\u4E0A\u9650`, id);
+        return invalid("bad_request", `session.load.messages \u8D85\u8FC7 ${LIMITS.maxSeedMessages} \u6761\u4E0A\u9650`);
       const messages = [];
       for (let index3 = 0; index3 < rawMessages.length; index3++) {
         const entry = rawMessages[index3];
-        if (!isRecord(entry)) return bad("bad_frame", `session.load.messages[${index3}] \u5FC5\u987B\u662F\u5BF9\u8C61`, id);
+        if (!isRecord(entry)) return invalid("bad_frame", `session.load.messages[${index3}] \u5FC5\u987B\u662F\u5BF9\u8C61`);
         const role = entry["role"];
         if (role !== "user" && role !== "assistant")
-          return bad("bad_frame", `session.load.messages[${index3}].role \u53EA\u80FD\u662F user/assistant`, id);
+          return invalid("bad_frame", `session.load.messages[${index3}].role \u53EA\u80FD\u662F user/assistant`);
         if (typeof entry["text"] !== "string")
-          return bad("bad_frame", `session.load.messages[${index3}].text \u5FC5\u987B\u662F\u5B57\u7B26\u4E32`, id);
+          return invalid("bad_frame", `session.load.messages[${index3}].text \u5FC5\u987B\u662F\u5B57\u7B26\u4E32`);
         if (!isFiniteNumber(entry["timestamp"]))
-          return bad("bad_frame", `session.load.messages[${index3}].timestamp \u5FC5\u987B\u662F\u6570\u5B57`, id);
+          return invalid("bad_frame", `session.load.messages[${index3}].timestamp \u5FC5\u987B\u662F\u6570\u5B57`);
         messages.push({ role, text: entry["text"], timestamp: entry["timestamp"] });
       }
-      return { ok: true, frame: { type: "session.load", id, sessionId: value["sessionId"], messages } };
+      return {
+        ok: true,
+        request: { id, method: AGENT_METHODS.sessionLoad, params: { sessionId: params["sessionId"], messages } }
+      };
     }
-    case "prompt": {
-      if (id === void 0) return bad("bad_frame", "prompt \u7F3A\u5C11 id");
-      if (typeof value["text"] !== "string") return bad("bad_frame", "prompt.text \u5FC5\u987B\u662F\u5B57\u7B26\u4E32", id);
-      if (value["text"].trim().length === 0) return bad("bad_request", "prompt.text \u4E0D\u80FD\u4E3A\u7A7A", id);
-      if (value["text"].length > LIMITS.maxPromptChars)
-        return bad("bad_request", `prompt.text \u8D85\u8FC7 ${LIMITS.maxPromptChars} \u5B57\u7B26\u4E0A\u9650`, id);
-      return { ok: true, frame: { type: "prompt", id, text: value["text"] } };
+    case AGENT_METHODS.prompt: {
+      if (!isRecord(params)) return invalid("bad_frame", "prompt \u53C2\u6570\u5FC5\u987B\u662F\u5BF9\u8C61");
+      if (typeof params["text"] !== "string") return invalid("bad_frame", "prompt.text \u5FC5\u987B\u662F\u5B57\u7B26\u4E32");
+      if (params["text"].trim().length === 0) return invalid("bad_request", "prompt.text \u4E0D\u80FD\u4E3A\u7A7A");
+      if (params["text"].length > LIMITS.maxPromptChars)
+        return invalid("bad_request", `prompt.text \u8D85\u8FC7 ${LIMITS.maxPromptChars} \u5B57\u7B26\u4E0A\u9650`);
+      return { ok: true, request: { id, method: AGENT_METHODS.prompt, params: { text: params["text"] } } };
     }
-    case "cancel": {
-      if (id === void 0) return bad("bad_frame", "cancel \u7F3A\u5C11 id");
-      if (!nonEmptyString(value["targetId"])) return bad("bad_frame", "cancel.targetId \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32", id);
-      return { ok: true, frame: { type: "cancel", id, targetId: value["targetId"] } };
+    case AGENT_METHODS.cancel: {
+      if (!isRecord(params)) return invalid("bad_frame", "cancel \u53C2\u6570\u5FC5\u987B\u662F\u5BF9\u8C61");
+      if (!nonEmptyString(params["targetId"])) return invalid("bad_frame", "cancel.targetId \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32");
+      return { ok: true, request: { id, method: AGENT_METHODS.cancel, params: { targetId: params["targetId"] } } };
     }
-    case "ping": {
-      if (id === void 0) return bad("bad_frame", "ping \u7F3A\u5C11 id");
-      return { ok: true, frame: { type: "ping", id } };
-    }
-    case "shutdown": {
-      if (id === void 0) return bad("bad_frame", "shutdown \u7F3A\u5C11 id");
-      return { ok: true, frame: { type: "shutdown", id } };
-    }
+    case AGENT_METHODS.ping:
+      return { ok: true, request: { id, method: AGENT_METHODS.ping, params: {} } };
+    case AGENT_METHODS.shutdown:
+      return { ok: true, request: { id, method: AGENT_METHODS.shutdown, params: {} } };
     default:
-      return bad("unknown_type", `\u672A\u77E5\u7684\u5E27\u7C7B\u578B\uFF1A${type}`, id);
+      return { ok: false, error: { code: "method_not_found", message: `\u672A\u77E5\u65B9\u6CD5\uFF1A${frame.method}` } };
   }
 }
 var SECRET_PATTERNS = [
@@ -985,7 +1025,11 @@ function createTransport(options) {
     if (fatalReported) return;
     fatalReported = true;
     try {
-      writer.write({ type: "fatal", code, message: truncateToBytes(redact(message, options.getSecrets()), 512) });
+      writer.write({
+        kind: "fatal",
+        version: PROTOCOL_VERSION,
+        error: { code, message: truncateToBytes(redact(message, options.getSecrets()), 512) }
+      });
     } catch {
       writeStderrLine(`[runtime:fatal] ${code}: ${message}`);
     }
@@ -993,7 +1037,6 @@ function createTransport(options) {
   };
   const pending = [];
   let pendingBytes = 0;
-  let discarding = false;
   const handleLine = (line) => {
     queue = queue.then(async () => {
       if (closed) return;
@@ -1001,10 +1044,7 @@ function createTransport(options) {
     }).catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
       writeStderrLine(`[runtime:error] \u5E27\u5904\u7406\u5931\u8D25\uFF1A${message}`);
-      try {
-        writer.write({ type: "error", code: "internal", message: "\u5E27\u5904\u7406\u5931\u8D25" });
-      } catch {
-      }
+      reportFatal("internal", "\u5E27\u5904\u7406\u5931\u8D25");
     });
   };
   process.stdin.on("data", (chunk) => {
@@ -1014,25 +1054,15 @@ function createTransport(options) {
       const newlineIndex = chunk.indexOf(10, start);
       const end = newlineIndex === -1 ? chunk.length : newlineIndex;
       const slice = chunk.subarray(start, end);
-      if (discarding) {
-        if (newlineIndex !== -1) discarding = false;
-      } else if (pendingBytes + slice.length > LIMITS.maxInboundFrameBytes) {
-        pending.length = 0;
-        pendingBytes = 0;
-        discarding = newlineIndex === -1;
-        try {
-          writer.write({
-            type: "error",
-            code: "too_large",
-            message: `\u5165\u7AD9\u5E27\u8D85\u8FC7 ${LIMITS.maxInboundFrameBytes} \u5B57\u8282\u4E0A\u9650\uFF0C\u5DF2\u4E22\u5F03`
-          });
-        } catch {
-        }
-      } else if (slice.length > 0) {
+      if (pendingBytes + slice.length > LIMITS.maxInboundFrameBytes) {
+        reportFatal("too_large", `\u5165\u7AD9\u5E27\u8D85\u8FC7 ${LIMITS.maxInboundFrameBytes} \u5B57\u8282\u4E0A\u9650`);
+        return;
+      }
+      if (slice.length > 0) {
         pending.push(slice);
         pendingBytes += slice.length;
       }
-      if (newlineIndex !== -1 && !discarding && pendingBytes > 0) {
+      if (newlineIndex !== -1 && pendingBytes > 0) {
         const line = Buffer.concat(pending).toString("utf8").replace(/\r$/, "");
         pending.length = 0;
         pendingBytes = 0;
@@ -13084,29 +13114,39 @@ function createSession(deps) {
   const proxyFetch = createProxyFetch(deps.env);
   let initialized = false;
   let shuttingDown = false;
+  let fatalFailure;
   let sessionId;
   let descriptor;
   let transcript = [];
   let agent;
   let active;
   function fail(id, code, message) {
-    deps.emit(id === void 0 ? { type: "error", code, message } : { type: "error", id, code, message });
+    deps.emit({ kind: "response", version: PROTOCOL_VERSION, id, error: { code, message } });
   }
   function ok(id, result) {
-    deps.emit(result === void 0 ? { type: "ok", id } : { type: "ok", id, result });
+    deps.emit(
+      result === void 0 ? { kind: "response", version: PROTOCOL_VERSION, id, result: {} } : { kind: "response", version: PROTOCOL_VERSION, id, result }
+    );
+  }
+  function fatal2(code, message) {
+    shuttingDown = true;
+    const error = { code, message: redact(message, sessionSecrets()).slice(0, 512) };
+    fatalFailure ??= error;
+    deps.emit({ kind: "fatal", version: PROTOCOL_VERSION, error });
   }
   function emitEvent(run, event) {
+    const frame = (payload) => ({
+      kind: "event",
+      version: PROTOCOL_VERSION,
+      event: AGENT_RUN_EVENT,
+      payload: { runId: run.frameId, sequence: run.seq, event: payload }
+    });
     try {
-      deps.emit({ type: "event", runId: run.frameId, seq: run.seq, event });
+      deps.emit(frame(event));
       run.seq += 1;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      deps.emit({
-        type: "event",
-        runId: run.frameId,
-        seq: run.seq,
-        event: { type: "error", code: "outbound_too_large", message: `\u4E8B\u4EF6\u5E27\u65E0\u6CD5\u4E0B\u53D1\uFF1A${detail}` }
-      });
+      deps.emit(frame({ type: "error", code: "outbound_too_large", message: `\u4E8B\u4EF6\u5E27\u65E0\u6CD5\u4E0B\u53D1\uFF1A${detail}` }));
       run.seq += 1;
     }
   }
@@ -13185,9 +13225,9 @@ function createSession(deps) {
     run.usage.cost.cacheWrite += usage.cost.cacheWrite;
     run.usage.cost.total += usage.cost.total;
   }
-  async function runPrompt(frame) {
+  async function runPrompt(params, runId) {
     const run = {
-      frameId: frame.id,
+      frameId: runId,
       seq: 0,
       usage: { ...EMPTY_USAGE2, cost: { ...EMPTY_USAGE2.cost } },
       lastStopReason: void 0,
@@ -13204,7 +13244,7 @@ function createSession(deps) {
     }
     const unsubscribe = current.subscribe((event) => onAgentEvent(run, event));
     try {
-      await current.prompt(frame.text);
+      await current.prompt(params.text);
     } catch (error) {
       emitEvent(run, { type: "error", code: "internal", message: errorText(error) });
       run.errorReported = true;
@@ -13238,135 +13278,146 @@ function createSession(deps) {
   }
   function handleHello(frame) {
     if (initialized) {
-      fail(frame.id, "already_initialized", "\u4F1A\u8BDD\u5DF2\u63E1\u624B");
+      fatal2("already_initialized", "\u4F1A\u8BDD\u5DF2\u63E1\u624B\uFF0C\u62D2\u7EDD\u91CD\u590D hello");
       return;
     }
-    const common = frame.protocolVersions.filter((version) => SUPPORTED_PROTOCOL_VERSIONS.includes(version));
+    const common = frame.supported_versions.filter((version) => SUPPORTED_PROTOCOL_VERSIONS.includes(version));
     if (common.length === 0) {
-      fail(
-        frame.id,
+      fatal2(
         "unsupported_version",
-        `\u534F\u8BAE\u7248\u672C\u4E0D\u76F8\u4EA4\uFF1AHost \u652F\u6301 [${frame.protocolVersions.join(", ")}]\uFF0C\u8FD0\u884C\u65F6\u652F\u6301 [${SUPPORTED_PROTOCOL_VERSIONS.join(", ")}]`
+        `\u534F\u8BAE\u7248\u672C\u4E0D\u76F8\u4EA4\uFF1AHost \u652F\u6301 [${frame.supported_versions.join(", ")}]\uFF0C\u8FD0\u884C\u65F6\u652F\u6301 [${SUPPORTED_PROTOCOL_VERSIONS.join(", ")}]`
       );
-      shuttingDown = true;
       return;
     }
     initialized = true;
-    deps.emit({ type: "ready", protocolVersion: PROTOCOL_VERSION, runtime: deps.runtime });
-    ok(frame.id);
+    deps.emit({
+      kind: "hello",
+      version: PROTOCOL_VERSION,
+      protocol: WIRE_PROTOCOL_ID,
+      supported_versions: [...SUPPORTED_PROTOCOL_VERSIONS],
+      runtime: deps.runtime.name,
+      capabilities: Object.values(AGENT_METHODS)
+    });
   }
-  function handleModelSet(frame) {
+  function handleModelSet(id, params) {
     if (active) {
-      fail(frame.id, "busy", "\u6709\u6B63\u5728\u8FDB\u884C\u7684 run\uFF0C\u65E0\u6CD5\u5207\u6362\u6A21\u578B");
+      fail(id, "busy", "\u6709\u6B63\u5728\u8FDB\u884C\u7684 run\uFF0C\u65E0\u6CD5\u5207\u6362\u6A21\u578B");
       return;
     }
-    if (deps.supportedApis && !deps.supportedApis.includes(frame.model.api)) {
-      fail(frame.id, "bad_request", `API ${frame.model.api} \u4E0D\u53D7\u6B64\u8FD0\u884C\u65F6\u652F\u6301`);
+    if (deps.supportedApis && !deps.supportedApis.includes(params.model.api)) {
+      fail(id, "bad_request", `API ${params.model.api} \u4E0D\u53D7\u6B64\u8FD0\u884C\u65F6\u652F\u6301`);
       return;
     }
-    if (!credentials.has(frame.model.provider)) {
-      fail(frame.id, "bad_request", `provider ${frame.model.provider} \u5C1A\u672A\u4E0B\u53D1\u51ED\u8BC1\uFF0C\u8BF7\u5148\u53D1\u9001 credentials.set`);
+    if (!credentials.has(params.model.provider)) {
+      fail(id, "bad_request", `provider ${params.model.provider} \u5C1A\u672A\u4E0B\u53D1\u51ED\u8BC1\uFF0C\u8BF7\u5148\u53D1\u9001 agent.credentials.set`);
       return;
     }
-    descriptor = frame.model;
+    descriptor = params.model;
     models.setProvider(
       deps.createProvider({
-        descriptor: frame.model,
-        getApiKey: () => credentials.get(frame.model.provider)?.apiKey
+        descriptor: params.model,
+        getApiKey: () => credentials.get(params.model.provider)?.apiKey
       })
     );
     rebuildAgent();
-    ok(frame.id);
+    ok(id);
   }
-  function handleSessionLoad(frame) {
+  function handleSessionLoad(id, params) {
     if (active) {
-      fail(frame.id, "busy", "\u6709\u6B63\u5728\u8FDB\u884C\u7684 run\uFF0C\u65E0\u6CD5\u91CD\u5EFA\u4F1A\u8BDD");
+      fail(id, "busy", "\u6709\u6B63\u5728\u8FDB\u884C\u7684 run\uFF0C\u65E0\u6CD5\u91CD\u5EFA\u4F1A\u8BDD");
       return;
     }
-    sessionId = frame.sessionId;
-    transcript = frame.messages.map(seedToMessage);
+    sessionId = params.sessionId;
+    transcript = params.messages.map(seedToMessage);
     rebuildAgent();
-    ok(frame.id, { sessionId, messageCount: transcript.length });
+    ok(id, { sessionId, messageCount: transcript.length });
   }
-  function handlePrompt(frame) {
+  function handlePrompt(id, params) {
     if (active) {
-      fail(frame.id, "busy", "\u5DF2\u6709 run \u5728\u8FDB\u884C\uFF0C\u8BF7\u5148\u7B49\u5F85\u7ED3\u675F\u6216\u53D1\u9001 cancel");
+      fail(id, "busy", "\u5DF2\u6709 run \u5728\u8FDB\u884C\uFF0C\u8BF7\u5148\u7B49\u5F85\u7ED3\u675F\u6216\u53D1\u9001 agent.cancel");
       return;
     }
     if (!agent) {
-      fail(frame.id, "no_model", "\u5C1A\u672A\u901A\u8FC7 model.set \u9009\u5B9A\u6A21\u578B");
+      fail(id, "no_model", "\u5C1A\u672A\u901A\u8FC7 agent.model.set \u9009\u5B9A\u6A21\u578B");
       return;
     }
-    ok(frame.id);
-    void runPrompt(frame);
+    ok(id);
+    void runPrompt(params, id);
   }
-  function handleCancel(frame) {
-    if (!active || active.frameId !== frame.targetId) {
-      ok(frame.id, { cancelled: false });
+  function handleCancel(id, params) {
+    if (!active || active.frameId !== params.targetId) {
+      ok(id, { cancelled: false });
       return;
     }
     agent?.abort();
-    ok(frame.id, { cancelled: true });
+    ok(id, { cancelled: true });
   }
   function sessionSecrets() {
     return [...credentials.values()].map((entry) => entry.apiKey);
   }
+  function dispatch(request) {
+    switch (request.method) {
+      case AGENT_METHODS.credentialsSet:
+        credentials.set(request.params.provider, {
+          credentialId: request.params.credentialId,
+          apiKey: request.params.apiKey
+        });
+        ok(request.id);
+        return;
+      case AGENT_METHODS.credentialsClear:
+        credentials.delete(request.params.provider);
+        ok(request.id);
+        return;
+      case AGENT_METHODS.modelSet:
+        handleModelSet(request.id, request.params);
+        return;
+      case AGENT_METHODS.sessionLoad:
+        handleSessionLoad(request.id, request.params);
+        return;
+      case AGENT_METHODS.prompt:
+        handlePrompt(request.id, request.params);
+        return;
+      case AGENT_METHODS.cancel:
+        handleCancel(request.id, request.params);
+        return;
+      case AGENT_METHODS.ping:
+        ok(request.id, { pong: true });
+        return;
+      case AGENT_METHODS.shutdown:
+        shuttingDown = true;
+        agent?.abort();
+        ok(request.id);
+        return;
+    }
+  }
   return {
     listSecrets: sessionSecrets,
     isShuttingDown: () => shuttingDown,
+    fatalError: () => fatalFailure,
     async handleFrame(line) {
-      const parsed = parseHostFrame(line);
-      if (!parsed.ok) {
-        fail(parsed.id, parsed.code, parsed.message);
-        return;
-      }
-      const frame = parsed.frame;
-      if (!initialized && frame.type !== "hello") {
-        fail(frame.id, "not_initialized", "\u5C1A\u672A\u63E1\u624B\uFF0C\u8BF7\u5148\u53D1\u9001 hello");
-        return;
-      }
-      switch (frame.type) {
-        case "hello":
-          handleHello(frame);
-          return;
-        case "credentials.set":
-          credentials.set(frame.provider, { credentialId: frame.credentialId, apiKey: frame.apiKey });
-          ok(frame.id);
-          return;
-        case "credentials.clear":
-          credentials.delete(frame.provider);
-          ok(frame.id);
-          return;
-        case "model.set":
-          handleModelSet(frame);
-          return;
-        case "session.load":
-          handleSessionLoad(frame);
-          return;
-        case "prompt":
-          handlePrompt(frame);
-          return;
-        case "cancel":
-          handleCancel(frame);
-          return;
-        case "ping":
-          deps.emit({ type: "pong", id: frame.id });
-          return;
-        case "shutdown":
-          shuttingDown = true;
-          agent?.abort();
-          ok(frame.id);
-          return;
-        default: {
-          const exhaustive = frame;
-          fail(
-            exhaustive.id,
-            "unknown_type",
-            `\u672A\u77E5\u5E27\u7C7B\u578B\uFF1A${exhaustive.type}`
-          );
+      const outcome = parseHostFrame(line);
+      if (!outcome.ok) {
+        if (outcome.kind === "fatal") {
+          fatal2(outcome.error.code, outcome.error.message);
           return;
         }
+        fail(outcome.id, outcome.error.code, outcome.error.message);
+        return;
       }
+      if (!initialized && outcome.frame.kind !== "hello") {
+        fatal2("not_initialized", "\u9996\u5E27\u5FC5\u987B\u662F hello");
+        return;
+      }
+      if (outcome.frame.kind === "hello") {
+        handleHello(outcome.frame);
+        return;
+      }
+      const parsed = parseAgentRequest(outcome.frame);
+      if (!parsed.ok) {
+        fail(outcome.frame.id, parsed.error.code, parsed.error.message);
+        return;
+      }
+      dispatch(parsed.request);
     }
   };
 }
@@ -13478,7 +13529,8 @@ function finish(code = 0) {
 var transport = createTransport({
   onFrame: async (line) => {
     await session?.handleFrame(line);
-    if (session?.isShuttingDown()) finish(0);
+    if (!session?.isShuttingDown()) return;
+    finish(session.fatalError() ? 1 : 0);
   },
   onFatal: (code, message) => {
     transport.writer.log("error", `fatal ${code}: ${message}`);

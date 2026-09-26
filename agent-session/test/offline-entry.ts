@@ -59,7 +59,9 @@ function finish(code = 0): void {
 const transport = createTransport({
 	onFrame: async (line) => {
 		await session?.handleFrame(line);
-		if (session?.isShuttingDown()) finish(0);
+		if (!session?.isShuttingDown()) return;
+		// 与生产入口同构：干净停机退出 0，fatal 退出非 0。
+		finish(session.fatalError() ? 1 : 0);
 	},
 	onFatal: (code, message) => {
 		transport.writer.log("error", `fatal ${code}: ${message}`);

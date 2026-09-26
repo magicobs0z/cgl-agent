@@ -134,7 +134,7 @@
     "runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "entry", "engines"],
+      "required": ["kind", "entry", "engines", "wire_protocol"],
       "properties": {
         "kind": {
           "type": "string",
@@ -158,9 +158,27 @@
             }
           },
           "description": "解释器版本要求。"
+        },
+        "wire_protocol": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "version"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "enum": ["copper-addon.ndjson"],
+              "description": "进程线协议标识。内核与通用 helper、Node Agent 共用同一套信封，旧的长度前缀 helper 协议不再被接受，也没有回退。"
+            },
+            "version": {
+              "type": "integer",
+              "enum": [2],
+              "description": "协议主版本。与 schema_version、api_version 分别表达不同的兼容维度，不可互相替代。"
+            }
+          },
+          "description": "进程线协议声明（必填）。内核在派生进程之前据此判定兼容性，缺失或声明了不支持的标识/版本即拒绝启动。"
         }
       },
-      "description": "受监管运行时声明（可选）。一旦声明，内核负责定位运行时、校验版本、派生并监管会话；模块自身不启动进程，也不申请 `process:spawn`。声明它的清单必须把 schema_version 升到 \"2\" 且 api_version 升到 2。"
+      "description": "受监管运行时声明（可选）。一旦声明，内核负责定位运行时、校验版本、派生并监管会话；模块自身不启动进程，也不申请 `process:spawn`。声明它的清单必须把 schema_version 升到 \"2\" 且 api_version 升到 2，并显式声明 wire_protocol。"
     },
     "permissions": {
       "type": "array",

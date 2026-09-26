@@ -32,7 +32,10 @@ function finish(code = 0): void {
 const transport = createTransport({
 	onFrame: async (line) => {
 		await session?.handleFrame(line);
-		if (session?.isShuttingDown()) finish(0);
+		if (!session?.isShuttingDown()) return;
+		// 干净的 `agent.shutdown` 退出 0；协议/runtime 致命错误退出非 0，
+		// 让内核 supervisor 能区分「正常停机」与「异常退出」。
+		finish(session.fatalError() ? 1 : 0);
 	},
 	onFatal: (code, message) => {
 		transport.writer.log("error", `fatal ${code}: ${message}`);

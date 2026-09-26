@@ -13,7 +13,7 @@
  * stderr 输出逐行限长并脱敏；它只用于诊断，永远不参与协议。
  */
 
-import { LIMITS, redact, type ErrorCode, type RuntimeFrame } from "./protocol.ts";
+import { LIMITS, PROTOCOL_VERSION, redact, type ErrorCode, type RuntimeFrame } from "./protocol.ts";
 
 /** 传输层向外暴露的写入接口。 */
 export interface TransportWriter {
@@ -118,7 +118,11 @@ export function createTransport(options: TransportOptions): { writer: TransportW
 		if (fatalReported) return;
 		fatalReported = true;
 		try {
-			writer.write({ type: "fatal", code, message: truncateToBytes(redact(message, options.getSecrets()), 512) });
+			writer.write({
+				kind: "fatal",
+				version: PROTOCOL_VERSION,
+				error: { code, message: truncateToBytes(redact(message, options.getSecrets()), 512) },
+			});
 		} catch {
 			// stdout 已不可用（例如对端关闭）：stderr 仍留一份诊断。
 			writeStderrLine(`[runtime:fatal] ${code}: ${message}`);
@@ -126,10 +130,12 @@ export function createTransport(options: TransportOptions): { writer: TransportW
 		options.onFatal(code, message);
 	};
 
-	// ---- 入站：按字节缓冲切行，超限即丢弃到换行 ----
+	// ---- 入站：按字节缓冲切行，超限即终止会话 ----
+	//
+	// 统一协议把「帧超过入站上限」定为协议错误：继续读取只会让两端对同一条
+	// 字节流的位置理解不一致，因此不做「丢到换行再续读」的容错，直接 fatal。
 	const pending: Buffer[] = [];
 	let pendingBytes = 0;
-	let discarding = false;
 
 	const handleLine = (line: string): void => {
 		queue = queue
@@ -138,14 +144,10 @@ export function createTransport(options: TransportOptions): { writer: TransportW
 				await options.onFrame(line, writer);
 			})
 			.catch((error: unknown) => {
-				// 单帧处理异常不应终止会话：回报内部错误并继续。
+				// 单帧处理异常属运行时内部故障：会话状态已不可信，终止而不是继续。
 				const message = error instanceof Error ? error.message : String(error);
 				writeStderrLine(`[runtime:error] 帧处理失败：${message}`);
-				try {
-					writer.write({ type: "error", code: "internal", message: "帧处理失败" });
-				} catch {
-					// 忽略：出站不可用时会话即将结束。
-				}
+				reportFatal("internal", "帧处理失败");
 			});
 	};
 
@@ -157,28 +159,16 @@ export function createTransport(options: TransportOptions): { writer: TransportW
 			const end = newlineIndex === -1 ? chunk.length : newlineIndex;
 			const slice = chunk.subarray(start, end);
 
-			if (discarding) {
-				// 仍在丢弃超长行，直到换行为止。
-				if (newlineIndex !== -1) discarding = false;
-			} else if (pendingBytes + slice.length > LIMITS.maxInboundFrameBytes) {
-				pending.length = 0;
-				pendingBytes = 0;
-				discarding = newlineIndex === -1;
-				try {
-					writer.write({
-						type: "error",
-						code: "too_large",
-						message: `入站帧超过 ${LIMITS.maxInboundFrameBytes} 字节上限，已丢弃`,
-					});
-				} catch {
-					// 出站不可用：继续丢弃以保持流同步。
-				}
-			} else if (slice.length > 0) {
+			if (pendingBytes + slice.length > LIMITS.maxInboundFrameBytes) {
+				reportFatal("too_large", `入站帧超过 ${LIMITS.maxInboundFrameBytes} 字节上限`);
+				return;
+			}
+			if (slice.length > 0) {
 				pending.push(slice);
 				pendingBytes += slice.length;
 			}
 
-			if (newlineIndex !== -1 && !discarding && pendingBytes > 0) {
+			if (newlineIndex !== -1 && pendingBytes > 0) {
 				const line = Buffer.concat(pending).toString("utf8").replace(/\r$/, "");
 				pending.length = 0;
 				pendingBytes = 0;

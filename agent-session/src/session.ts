@@ -34,13 +34,17 @@ import {
 } from "@earendil-works/pi-ai";
 import { createProxyFetch, type ProxyEnv } from "./proxy-fetch.ts";
 import {
+	AGENT_METHODS,
+	AGENT_RUN_EVENT,
 	LIMITS,
 	PROTOCOL_VERSION,
 	SUPPORTED_PROTOCOL_VERSIONS,
+	WIRE_PROTOCOL_ID,
+	parseAgentRequest,
 	parseHostFrame,
 	redact,
+	type AgentRequest,
 	type ErrorCode,
-	type HostFrame,
 	type HostModelDescriptor,
 	type HostSeedMessage,
 	type PersistedAssistantMessage,
@@ -48,6 +52,8 @@ import {
 	type PersistedUsage,
 	type RunEvent,
 	type RuntimeFrame,
+	type WireError,
+	type WireHello,
 } from "./protocol.ts";
 
 /**
@@ -91,9 +97,14 @@ export interface SessionDeps {
 	/** 建 provider。生产为 openai-completions 工厂，离线测试为 faux。 */
 	createProvider: (input: SessionProviderInput) => Provider;
 	supportedApis?: readonly string[];
-	/** 传给 provider 的代理环境变量（由内核注入）。 */
+	/** 传入 provider 的代理环境变量（由内核注入）。 */
 	env: ProxyEnv;
-	/** 运行时自述，出现在 `ready` 帧里。 */
+	/**
+	 * 运行时自述。
+	 *
+	 * `name` 出现在 hello 帧的 `runtime` 字段里；`version`/`node` 只用于诊断
+	 * 记录（模块版本以内核 manifest 为准，不靠运行时自报）。
+	 */
 	runtime: { name: string; version: string; node: string };
 	/** 覆盖默认系统提示（离线测试用）。 */
 	systemPrompt?: string;
@@ -104,8 +115,15 @@ export interface AgentSession {
 	handleFrame(line: string): Promise<void>;
 	/** 当前需要脱敏的密钥清单。 */
 	listSecrets(): readonly string[];
-	/** 是否已收到 shutdown，或握手失败而应终止进程。 */
+	/** 会话是否应结束（收到 shutdown，或已发出 fatal）。 */
 	isShuttingDown(): boolean;
+	/**
+	 * 已发出的 fatal 错误；没有则为 `undefined`。
+	 *
+	 * 入口据此区分退出码：干净的 `agent.shutdown` 退出 0，协议/runtime 致命错误
+	 * 退出非 0，便于内核 supervisor 判断是否属于「可重试的异常退出」。
+	 */
+	fatalError(): WireError | undefined;
 }
 
 interface ActiveRun {
@@ -125,6 +143,7 @@ export function createSession(deps: SessionDeps): AgentSession {
 
 	let initialized = false;
 	let shuttingDown = false;
+	let fatalFailure: WireError | undefined;
 	let sessionId: string | undefined;
 	let descriptor: HostModelDescriptor | undefined;
 	let transcript: Message[] = [];
@@ -133,27 +152,40 @@ export function createSession(deps: SessionDeps): AgentSession {
 
 	// ---- 出站工具 ----
 
-	function fail(id: string | undefined, code: ErrorCode, message: string): void {
-		deps.emit(id === undefined ? { type: "error", code, message } : { type: "error", id, code, message });
+	function fail(id: string, code: ErrorCode, message: string): void {
+		deps.emit({ kind: "response", version: PROTOCOL_VERSION, id, error: { code, message } });
 	}
 
 	function ok(id: string, result?: unknown): void {
-		deps.emit(result === undefined ? { type: "ok", id } : { type: "ok", id, result });
+		deps.emit(
+			result === undefined
+				? { kind: "response", version: PROTOCOL_VERSION, id, result: {} }
+				: { kind: "response", version: PROTOCOL_VERSION, id, result },
+		);
+	}
+
+	/** 协议级错误：会话不可继续，发出 `fatal` 后由入口终止进程。 */
+	function fatal(code: ErrorCode, message: string): void {
+		shuttingDown = true;
+		const error: WireError = { code, message: redact(message, sessionSecrets()).slice(0, 512) };
+		fatalFailure ??= error;
+		deps.emit({ kind: "fatal", version: PROTOCOL_VERSION, error });
 	}
 
 	/** 写事件帧；超限时降级为一帧错误事件，保证该 run 的事件序列不被静默截断。 */
 	function emitEvent(run: ActiveRun, event: RunEvent): void {
+		const frame = (payload: RunEvent): RuntimeFrame => ({
+			kind: "event",
+			version: PROTOCOL_VERSION,
+			event: AGENT_RUN_EVENT,
+			payload: { runId: run.frameId, sequence: run.seq, event: payload },
+		});
 		try {
-			deps.emit({ type: "event", runId: run.frameId, seq: run.seq, event });
+			deps.emit(frame(event));
 			run.seq += 1;
 		} catch (error) {
 			const detail = error instanceof Error ? error.message : String(error);
-			deps.emit({
-				type: "event",
-				runId: run.frameId,
-				seq: run.seq,
-				event: { type: "error", code: "outbound_too_large", message: `事件帧无法下发：${detail}` },
-			});
+			deps.emit(frame({ type: "error", code: "outbound_too_large", message: `事件帧无法下发：${detail}` }));
 			run.seq += 1;
 		}
 	}
@@ -248,9 +280,9 @@ export function createSession(deps: SessionDeps): AgentSession {
 
 	// ---- run 执行 ----
 
-	async function runPrompt(frame: Extract<HostFrame, { type: "prompt" }>): Promise<void> {
+	async function runPrompt(params: { text: string }, runId: string): Promise<void> {
 		const run: ActiveRun = {
-			frameId: frame.id,
+			frameId: runId,
 			seq: 0,
 			usage: { ...EMPTY_USAGE, cost: { ...EMPTY_USAGE.cost } },
 			lastStopReason: undefined,
@@ -269,7 +301,7 @@ export function createSession(deps: SessionDeps): AgentSession {
 
 		const unsubscribe = current.subscribe((event) => onAgentEvent(run, event));
 		try {
-			await current.prompt(frame.text);
+			await current.prompt(params.text);
 		} catch (error) {
 			emitEvent(run, { type: "error", code: "internal", message: errorText(error) });
 			run.errorReported = true;
@@ -309,149 +341,167 @@ export function createSession(deps: SessionDeps): AgentSession {
 
 	// ---- 命令处理 ----
 
-	function handleHello(frame: Extract<HostFrame, { type: "hello" }>): void {
+	function handleHello(frame: WireHello): void {
 		if (initialized) {
-			fail(frame.id, "already_initialized", "会话已握手");
+			// hello 无 `id`，无法回带关联错误；而「会话已固定到协商版本」后重复握手
+			// 说明对端状态与本地不一致，按协议级错误终止。
+			fatal("already_initialized", "会话已握手，拒绝重复 hello");
 			return;
 		}
-		const common = frame.protocolVersions.filter((version) => SUPPORTED_PROTOCOL_VERSIONS.includes(version));
+		const common = frame.supported_versions.filter((version) => SUPPORTED_PROTOCOL_VERSIONS.includes(version));
 		if (common.length === 0) {
-			fail(
-				frame.id,
+			// 版本不交会就没有继续对话的意义：fatal 之后由入口终止进程。
+			fatal(
 				"unsupported_version",
-				`协议版本不相交：Host 支持 [${frame.protocolVersions.join(", ")}]，`
+				`协议版本不相交：Host 支持 [${frame.supported_versions.join(", ")}]，`
 					+ `运行时支持 [${SUPPORTED_PROTOCOL_VERSIONS.join(", ")}]`,
 			);
-			// 版本不交会就没有继续对话的意义：置位后由入口终止进程。
-			shuttingDown = true;
 			return;
 		}
 		initialized = true;
-		deps.emit({ type: "ready", protocolVersion: PROTOCOL_VERSION, runtime: deps.runtime });
-		ok(frame.id);
+		// 回以本端 hello：runtime 身份 + 本端能响应的方法集合。
+		deps.emit({
+			kind: "hello",
+			version: PROTOCOL_VERSION,
+			protocol: WIRE_PROTOCOL_ID,
+			supported_versions: [...SUPPORTED_PROTOCOL_VERSIONS],
+			runtime: deps.runtime.name,
+			capabilities: Object.values(AGENT_METHODS),
+		});
 	}
 
-	function handleModelSet(frame: Extract<HostFrame, { type: "model.set" }>): void {
+	function handleModelSet(id: string, params: { model: HostModelDescriptor }): void {
 		if (active) {
-			fail(frame.id, "busy", "有正在进行的 run，无法切换模型");
+			fail(id, "busy", "有正在进行的 run，无法切换模型");
 			return;
 		}
-		if (deps.supportedApis && !deps.supportedApis.includes(frame.model.api)) {
-			fail(frame.id, "bad_request", `API ${frame.model.api} 不受此运行时支持`);
+		if (deps.supportedApis && !deps.supportedApis.includes(params.model.api)) {
+			fail(id, "bad_request", `API ${params.model.api} 不受此运行时支持`);
 			return;
 		}
-		if (!credentials.has(frame.model.provider)) {
-			fail(frame.id, "bad_request", `provider ${frame.model.provider} 尚未下发凭证，请先发送 credentials.set`);
+		if (!credentials.has(params.model.provider)) {
+			fail(id, "bad_request", `provider ${params.model.provider} 尚未下发凭证，请先发送 agent.credentials.set`);
 			return;
 		}
-		descriptor = frame.model;
+		descriptor = params.model;
 		models.setProvider(
 			deps.createProvider({
-				descriptor: frame.model,
-				getApiKey: () => credentials.get(frame.model.provider)?.apiKey,
+				descriptor: params.model,
+				getApiKey: () => credentials.get(params.model.provider)?.apiKey,
 			}),
 		);
 		rebuildAgent();
-		ok(frame.id);
+		ok(id);
 	}
 
-	function handleSessionLoad(frame: Extract<HostFrame, { type: "session.load" }>): void {
+	function handleSessionLoad(id: string, params: { sessionId: string; messages: HostSeedMessage[] }): void {
 		if (active) {
-			fail(frame.id, "busy", "有正在进行的 run，无法重建会话");
+			fail(id, "busy", "有正在进行的 run，无法重建会话");
 			return;
 		}
-		sessionId = frame.sessionId;
-		transcript = frame.messages.map(seedToMessage);
+		sessionId = params.sessionId;
+		transcript = params.messages.map(seedToMessage);
 		rebuildAgent();
-		ok(frame.id, { sessionId, messageCount: transcript.length });
+		ok(id, { sessionId, messageCount: transcript.length });
 	}
 
-	function handlePrompt(frame: Extract<HostFrame, { type: "prompt" }>): void {
+	function handlePrompt(id: string, params: { text: string }): void {
 		if (active) {
-			fail(frame.id, "busy", "已有 run 在进行，请先等待结束或发送 cancel");
+			fail(id, "busy", "已有 run 在进行，请先等待结束或发送 agent.cancel");
 			return;
 		}
 		if (!agent) {
-			fail(frame.id, "no_model", "尚未通过 model.set 选定模型");
+			fail(id, "no_model", "尚未通过 agent.model.set 选定模型");
 			return;
 		}
-		ok(frame.id);
+		ok(id);
 		// 刻意不 await：run 期间传输层必须继续处理 cancel 等命令。
-		void runPrompt(frame);
+		void runPrompt(params, id);
 	}
 
-	function handleCancel(frame: Extract<HostFrame, { type: "cancel" }>): void {
-		if (!active || active.frameId !== frame.targetId) {
-			ok(frame.id, { cancelled: false });
+	function handleCancel(id: string, params: { targetId: string }): void {
+		if (!active || active.frameId !== params.targetId) {
+			ok(id, { cancelled: false });
 			return;
 		}
 		agent?.abort();
-		ok(frame.id, { cancelled: true });
+		ok(id, { cancelled: true });
 	}
 
 	function sessionSecrets(): readonly string[] {
 		return [...credentials.values()].map((entry) => entry.apiKey);
 	}
 
+	function dispatch(request: AgentRequest): void {
+		switch (request.method) {
+			case AGENT_METHODS.credentialsSet:
+				credentials.set(request.params.provider, {
+					credentialId: request.params.credentialId,
+					apiKey: request.params.apiKey,
+				});
+				ok(request.id);
+				return;
+			case AGENT_METHODS.credentialsClear:
+				credentials.delete(request.params.provider);
+				ok(request.id);
+				return;
+			case AGENT_METHODS.modelSet:
+				handleModelSet(request.id, request.params);
+				return;
+			case AGENT_METHODS.sessionLoad:
+				handleSessionLoad(request.id, request.params);
+				return;
+			case AGENT_METHODS.prompt:
+				handlePrompt(request.id, request.params);
+				return;
+			case AGENT_METHODS.cancel:
+				handleCancel(request.id, request.params);
+				return;
+			case AGENT_METHODS.ping:
+				ok(request.id, { pong: true });
+				return;
+			case AGENT_METHODS.shutdown:
+				shuttingDown = true;
+				agent?.abort();
+				ok(request.id);
+				return;
+		}
+	}
+
 	return {
 		listSecrets: sessionSecrets,
 		isShuttingDown: () => shuttingDown,
+		fatalError: () => fatalFailure,
 
 		async handleFrame(line: string): Promise<void> {
-			const parsed = parseHostFrame(line);
-			if (!parsed.ok) {
-				fail(parsed.id, parsed.code, parsed.message);
-				return;
-			}
-			const frame = parsed.frame;
-
-			if (!initialized && frame.type !== "hello") {
-				fail(frame.id, "not_initialized", "尚未握手，请先发送 hello");
-				return;
-			}
-
-			switch (frame.type) {
-				case "hello":
-					handleHello(frame);
-					return;
-				case "credentials.set":
-					credentials.set(frame.provider, { credentialId: frame.credentialId, apiKey: frame.apiKey });
-					ok(frame.id);
-					return;
-				case "credentials.clear":
-					credentials.delete(frame.provider);
-					ok(frame.id);
-					return;
-				case "model.set":
-					handleModelSet(frame);
-					return;
-				case "session.load":
-					handleSessionLoad(frame);
-					return;
-				case "prompt":
-					handlePrompt(frame);
-					return;
-				case "cancel":
-					handleCancel(frame);
-					return;
-				case "ping":
-					deps.emit({ type: "pong", id: frame.id });
-					return;
-				case "shutdown":
-					shuttingDown = true;
-					agent?.abort();
-					ok(frame.id);
-					return;
-				default: {
-					const exhaustive: never = frame;
-					fail(
-						(exhaustive as { id?: string }).id,
-						"unknown_type",
-						`未知帧类型：${(exhaustive as { type: string }).type}`,
-					);
+			const outcome = parseHostFrame(line);
+			if (!outcome.ok) {
+				if (outcome.kind === "fatal") {
+					fatal(outcome.error.code, outcome.error.message);
 					return;
 				}
+				fail(outcome.id, outcome.error.code, outcome.error.message);
+				return;
 			}
+
+			// 首帧必须是 hello：未协商就发业务帧说明对端状态与本地不一致。
+			// （信封层已保证这里只可能是 hello 或 request。）
+			if (!initialized && outcome.frame.kind !== "hello") {
+				fatal("not_initialized", "首帧必须是 hello");
+				return;
+			}
+			if (outcome.frame.kind === "hello") {
+				handleHello(outcome.frame);
+				return;
+			}
+
+			const parsed = parseAgentRequest(outcome.frame);
+			if (!parsed.ok) {
+				// 方法级错误：可关联、可恢复，回带同 id 的 response.error，会话继续。
+				fail(outcome.frame.id, parsed.error.code, parsed.error.message);
+				return;
+			}
+			dispatch(parsed.request);
 		},
 	};
 }

@@ -1,27 +1,33 @@
 /**
- * cgl-agent 受监管 Node 会话与铜内核之间的私有 IPC 协议。
+ * 统一附加进程线协议 `copper-addon.ndjson`（主版本 2）在 cgl-agent 侧的实现。
  *
- * 边界约定（与 docs/设计.md「运行时与进程模型」、docs/安全设计.md 一致）：
+ * 与通用 helper 共用同一套传输与信封规则（见 CopperCore `copper-module-abi::ipc`）：
  * - 传输是 stdin/stdout 上的 NDJSON：一行一帧，UTF-8，无 BOM。
+ * - 每帧形如 `{ kind, version, ... }`，`kind ∈ hello|request|response|notification|event|fatal`。
  * - stdout **只**承载协议帧；任何诊断/堆栈/第三方库输出都必须改道 stderr，
  *   由 transport.ts 覆写 console.* 保证。
- * - 方向：Host -> Runtime 是命令帧（每帧带 `id`），Runtime -> Host 是
- *   响应帧（`ok`/`error`，回带同一 `id`）与事件帧（`event`，带 `runId`/`seq`）。
- * - 本层只做「会话与模型调用」。工具执行、文件读取、联网等能力由内核另行
- *   设计（见 docs/MCP工具设计.md）；协议里预留了工具事件的线格式，但本层
- *   不提供任何绕过内核的通道。
+ * - 首帧必须是 `hello`；协商成功后会话固定到该版本。业务方法由 `request`/`response`
+ *   按唯一 `id` 关联；Agent 的流式输出使用 `event` 帧。
+ * - 协议级错误（坏 JSON、版本不符、帧方向或形状错误、超限、首帧非 hello）不可继续，
+ *   一律以 `fatal` 帧报告并终止会话；方法级错误（未知方法、参数非法、状态不允许）
+ *   回带同 `id` 的 `response.error`，会话继续。
+ *
+ * 与 helper 的差异仅在业务层：Agent 的方法命名空间是 `agent.*`，事件载荷带
+ * `runId` 与单调递增 `sequence`。信封、握手、帧上限、错误 DTO 完全相同。
  *
  * 版本演进：协议版本独立于模块版本。Host 在 `hello` 中给出它支持的版本集合，
  * 运行时不支持即拒绝启动，避免出现「双方都以为自己兼容」的静默错配。
  */
 
-export const PROTOCOL_VERSION = 1;
+export const WIRE_PROTOCOL_ID = "copper-addon.ndjson";
 
-/** 本运行时实现的版本集合（Host 的 `hello.protocolVersions` 需与之相交）。 */
+export const PROTOCOL_VERSION = 2;
+
+/** 本运行时实现的版本集合（Host 的 `hello.supported_versions` 需与之相交）。 */
 export const SUPPORTED_PROTOCOL_VERSIONS: readonly number[] = [PROTOCOL_VERSION];
 
 export const LIMITS = {
-	/** 单帧入站上限。超限的行被丢弃并回报 `too_large`，不终止会话。 */
+	/** 单帧入站上限。它是统一协议的更严格实现（协议硬上限为 8 MiB）。 */
 	maxInboundFrameBytes: 1024 * 1024,
 	/** 单帧出站上限。超限的出站事件会被替换为 `outbound_too_large` 错误事件。 */
 	maxOutboundFrameBytes: 256 * 1024,
@@ -39,15 +45,17 @@ export const LIMITS = {
 export const ERROR_CODES = [
 	/** 帧不是合法 JSON、或字段类型/必填项不符。 */
 	"bad_frame",
-	/** 帧类型未知。 */
+	/** 帧类别未知或方向错误（本方向不接受该 kind）。 */
 	"unknown_type",
+	/** 方法名未在本运行时注册。 */
+	"method_not_found",
 	/** 帧超过入站上限。 */
 	"too_large",
 	/** 出站帧超过上限（发生在事件帧上）。 */
 	"outbound_too_large",
 	/** 协议版本不相交。 */
 	"unsupported_version",
-	/** 尚未完成 `hello` 握手就发命令。 */
+	/** 尚未完成 `hello` 握手就发业务帧。 */
 	"not_initialized",
 	/** 重复握手。 */
 	"already_initialized",
@@ -74,8 +82,83 @@ export function isErrorCode(value: unknown): value is ErrorCode {
 }
 
 // ---------------------------------------------------------------------------
-// Host -> Runtime
+// 线信封
 // ---------------------------------------------------------------------------
+
+/** 统一错误 DTO：稳定机器可读 `code` + 安全诊断 `message`。 */
+export interface WireError {
+	code: ErrorCode;
+	message: string;
+}
+
+/** 首帧协商：携带协议标识、支持版本、runtime 身份与能力集合。无 `id`。 */
+export interface WireHello {
+	kind: "hello";
+	version: number;
+	protocol: string;
+	supported_versions: number[];
+	runtime: string;
+	capabilities: string[];
+}
+
+/** 双向请求：会话内唯一 `id` + 方法名 + JSON 参数。 */
+export interface WireRequest {
+	kind: "request";
+	version: number;
+	id: string;
+	method: string;
+	params: unknown;
+}
+
+/** 请求响应：必须回带同一 `id`，且恰含 `result` 或 `error` 之一。 */
+export interface WireResponse {
+	kind: "response";
+	version: number;
+	id: string;
+	result?: unknown;
+	error?: WireError;
+}
+
+/** 业务事件：不带请求关联 `id`。Agent 用它承载带 `runId`/`sequence` 的运行事件。 */
+export interface WireEvent {
+	kind: "event";
+	version: number;
+	event: string;
+	payload: unknown;
+}
+
+/** 致命错误：会话无法继续，收到即终止。 */
+export interface WireFatal {
+	kind: "fatal";
+	version: number;
+	error: WireError;
+}
+
+/** 运行时写向 Host 的帧。 */
+export type RuntimeFrame = WireHello | WireResponse | WireEvent | WireFatal;
+
+/** 运行时接受的入站帧。`notification`/`event`/`response` 在本方向属协议错误。 */
+export type HostFrame = WireHello | WireRequest;
+
+// ---------------------------------------------------------------------------
+// Host -> Runtime：方法命名空间与参数 DTO
+// ---------------------------------------------------------------------------
+
+export const AGENT_METHODS = {
+	credentialsSet: "agent.credentials.set",
+	credentialsClear: "agent.credentials.clear",
+	modelSet: "agent.model.set",
+	sessionLoad: "agent.session.load",
+	prompt: "agent.prompt",
+	cancel: "agent.cancel",
+	ping: "agent.ping",
+	shutdown: "agent.shutdown",
+} as const;
+
+export type AgentMethod = (typeof AGENT_METHODS)[keyof typeof AGENT_METHODS];
+
+/** Agent 事件帧的固定事件名：载荷里再区分具体 RunEvent。 */
+export const AGENT_RUN_EVENT = "agent.run";
 
 /** 单个模型描述。模型清单由内核（用户配置）持有，本层不硬编码任何 provider 目录。 */
 export interface HostModelDescriptor {
@@ -101,86 +184,50 @@ export interface HostSeedMessage {
 	timestamp: number;
 }
 
-export interface HelloFrame {
-	type: "hello";
-	id: string;
-	protocolVersions: number[];
-	host: { name: string; version: string };
-}
-
-export interface CredentialsSetFrame {
-	type: "credentials.set";
-	id: string;
+export interface CredentialsSetParams {
 	/** 不透明标识，仅用于回带与日志关联；密钥本体只在 Node 进程内存中。 */
 	credentialId: string;
 	provider: string;
 	apiKey: string;
 }
 
-export interface CredentialsClearFrame {
-	type: "credentials.clear";
-	id: string;
+export interface CredentialsClearParams {
 	provider: string;
 }
 
-export interface ModelSetFrame {
-	type: "model.set";
-	id: string;
+export interface ModelSetParams {
 	model: HostModelDescriptor;
 }
 
-export interface SessionLoadFrame {
-	type: "session.load";
-	id: string;
+export interface SessionLoadParams {
 	sessionId: string;
 	messages: HostSeedMessage[];
 }
 
-export interface PromptFrame {
-	type: "prompt";
-	id: string;
+export interface PromptParams {
 	text: string;
 }
 
-export interface CancelFrame {
-	type: "cancel";
-	id: string;
-	/** 要取消的 run 的帧 id（即触发它的 prompt 帧 id）。 */
+export interface CancelParams {
+	/** 要取消的 run 的帧 id（即触发它的 `agent.prompt` 请求 id）。 */
 	targetId: string;
 }
 
-export interface PingFrame {
-	type: "ping";
-	id: string;
-}
+export interface PingParams {}
 
-export interface ShutdownFrame {
-	type: "shutdown";
-	id: string;
-}
+export interface ShutdownParams {}
 
-export type HostFrame =
-	| HelloFrame
-	| CredentialsSetFrame
-	| CredentialsClearFrame
-	| ModelSetFrame
-	| SessionLoadFrame
-	| PromptFrame
-	| CancelFrame
-	| PingFrame
-	| ShutdownFrame;
-
-export const HOST_FRAME_TYPES: readonly HostFrame["type"][] = [
-	"hello",
-	"credentials.set",
-	"credentials.clear",
-	"model.set",
-	"session.load",
-	"prompt",
-	"cancel",
-	"ping",
-	"shutdown",
-];
+/** 已按方法校验并通过的入站请求：携带关联 `id` 与类型化参数。 */
+export type AgentRequest = { id: string } & (
+	| { method: typeof AGENT_METHODS.credentialsSet; params: CredentialsSetParams }
+	| { method: typeof AGENT_METHODS.credentialsClear; params: CredentialsClearParams }
+	| { method: typeof AGENT_METHODS.modelSet; params: ModelSetParams }
+	| { method: typeof AGENT_METHODS.sessionLoad; params: SessionLoadParams }
+	| { method: typeof AGENT_METHODS.prompt; params: PromptParams }
+	| { method: typeof AGENT_METHODS.cancel; params: CancelParams }
+	| { method: typeof AGENT_METHODS.ping; params: PingParams }
+	| { method: typeof AGENT_METHODS.shutdown; params: ShutdownParams }
+);
 
 // ---------------------------------------------------------------------------
 // Runtime -> Host：事件
@@ -311,65 +358,28 @@ export type RunEvent =
 	| RunEndEvent
 	| ErrorEvent;
 
-// ---------------------------------------------------------------------------
-// Runtime -> Host：帧
-// ---------------------------------------------------------------------------
-
-export interface ReadyFrame {
-	type: "ready";
-	protocolVersion: number;
-	runtime: { name: string; version: string; node: string };
-}
-
-export interface OkFrame {
-	type: "ok";
-	id: string;
-	result?: unknown;
-}
-
-/** `id` 可缺省：帧本身无法解析时（如超长/坏 JSON）Host 无从得知 id。 */
-export interface ErrorFrame {
-	type: "error";
-	id?: string;
-	code: ErrorCode;
-	message: string;
-}
-
-export interface EventFrame {
-	type: "event";
+/** `agent.run` 事件帧的载荷：`sequence` 在同一 `runId` 内从 0 单调递增、无空洞。 */
+export interface AgentRunEventPayload {
 	runId: string;
-	/** 同一 run 内从 0 单调递增，无空洞。 */
-	seq: number;
+	sequence: number;
 	event: RunEvent;
 }
-
-export interface FatalFrame {
-	type: "fatal";
-	code: ErrorCode;
-	message: string;
-}
-
-export interface PongFrame {
-	type: "pong";
-	id: string;
-}
-
-export type RuntimeFrame = ReadyFrame | OkFrame | ErrorFrame | EventFrame | FatalFrame | PongFrame;
-
-export const RUNTIME_FRAME_TYPES: readonly RuntimeFrame["type"][] = [
-	"ready",
-	"ok",
-	"error",
-	"event",
-	"fatal",
-	"pong",
-];
 
 // ---------------------------------------------------------------------------
 // 解析
 // ---------------------------------------------------------------------------
 
-export type ParseResult = { ok: true; frame: HostFrame } | { ok: false; id?: string; code: ErrorCode; message: string };
+/**
+ * 信封解析结果。
+ *
+ * - `fatal`：协议级错误，会话不可继续，须以 `fatal` 帧报告并终止。
+ * - `refusal`：方法级错误（本层只产出「方法未知/参数不合法」），回带同 `id` 的
+ *   `response.error`，会话继续。
+ */
+export type ParseOutcome =
+	| { ok: true; frame: HostFrame }
+	| { ok: false; kind: "fatal"; error: WireError }
+	| { ok: false; kind: "refusal"; id: string; error: WireError };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -387,41 +397,101 @@ function isPositiveInt(value: unknown): value is number {
 	return isFiniteNumber(value) && Number.isInteger(value) && value > 0;
 }
 
-/** 从任意对象里尽力提取回带用的 `id`；提取不到就不回带。 */
-function extractId(record: Record<string, unknown>): string | undefined {
-	const id = record["id"];
-	return typeof id === "string" && id.length > 0 ? id : undefined;
+function fatal(code: ErrorCode, message: string): ParseOutcome {
+	return { ok: false, kind: "fatal", error: { code, message } };
 }
 
-function bad(code: ErrorCode, message: string, id?: string): ParseResult {
-	return id === undefined ? { ok: false, code, message } : { ok: false, code, message, id };
+/**
+ * 解析一帧入站数据：只做**信封**校验。
+ *
+ * 方法参数不在这里校验——信封合法但参数不合法属「可关联的方法级错误」，
+ * 由 `parseAgentRequest` 返回 `refusal`，不能让整条会话因此终止。
+ * 信封本身不合法则说明字节流已错位，继续解析只会放大错误，故一律 `fatal`。
+ */
+export function parseHostFrame(line: string): ParseOutcome {
+	let value: unknown;
+	try {
+		value = JSON.parse(line);
+	} catch {
+		return fatal("bad_frame", "帧不是合法 JSON");
+	}
+	if (!isRecord(value)) return fatal("bad_frame", "帧必须是 JSON 对象");
+
+	const version = value["version"];
+	if (!isFiniteNumber(version) || !Number.isInteger(version)) return fatal("bad_frame", "帧缺少整数字段 version");
+	if (version !== PROTOCOL_VERSION) {
+		return fatal(
+			"unsupported_version",
+			`协议版本不相交：收到 v${version}，本运行时支持 [${SUPPORTED_PROTOCOL_VERSIONS.join(", ")}]`,
+		);
+	}
+
+	const kind = value["kind"];
+	if (typeof kind !== "string") return fatal("bad_frame", "帧缺少字符串字段 kind");
+
+	if (kind === "hello") {
+		const protocol = value["protocol"];
+		if (protocol !== WIRE_PROTOCOL_ID) return fatal("bad_frame", `hello.protocol 必须是 ${WIRE_PROTOCOL_ID}`);
+		const versions = value["supported_versions"];
+		if (!Array.isArray(versions) || versions.some((entry) => !isFiniteNumber(entry) || !Number.isInteger(entry)))
+			return fatal("bad_frame", "hello.supported_versions 必须是整数数组");
+		if (!nonEmptyString(value["runtime"])) return fatal("bad_frame", "hello.runtime 必须是非空字符串");
+		const capabilities = value["capabilities"];
+		if (!Array.isArray(capabilities) || capabilities.some((entry) => typeof entry !== "string"))
+			return fatal("bad_frame", "hello.capabilities 必须是字符串数组");
+		return {
+			ok: true,
+			frame: {
+				kind: "hello",
+				version,
+				protocol,
+				supported_versions: versions as number[],
+				runtime: value["runtime"],
+				capabilities: capabilities as string[],
+			},
+		};
+	}
+
+	if (kind === "request") {
+		const id = value["id"];
+		if (!nonEmptyString(id)) return fatal("bad_frame", "request.id 必须是非空字符串");
+		const method = value["method"];
+		if (!nonEmptyString(method)) return fatal("bad_frame", "request.method 必须是非空字符串");
+		if (!("params" in value)) return fatal("bad_frame", "request 缺少 params 字段");
+		return { ok: true, frame: { kind: "request", version, id, method, params: value["params"] } };
+	}
+
+	// 本方向只接受 hello 与 request：response/event/notification 属方向错误，
+	// 未知 kind 属形状错误。两者都说明对端状态与本地不一致，不可继续。
+	if (kind === "response" || kind === "event" || kind === "notification" || kind === "fatal") {
+		return fatal("unknown_type", `本方向不接受 ${kind} 帧`);
+	}
+	return fatal("unknown_type", `未知帧类别：${kind}`);
 }
 
-type FailedParse = { ok: false; id?: string; code: ErrorCode; message: string };
-
-function parseModelDescriptor(value: unknown, id?: string): { ok: true; model: HostModelDescriptor } | FailedParse {
-	if (!isRecord(value)) return bad("bad_frame", "model.set.model 必须是对象", id);
+function parseModelDescriptor(value: unknown): { ok: true; model: HostModelDescriptor } | { ok: false; error: WireError } {
+	const invalid = (message: string) => ({ ok: false as const, error: { code: "bad_frame" as ErrorCode, message } });
+	if (!isRecord(value)) return invalid("model.set.model 必须是对象");
 	const { provider, api, baseUrl, model } = value;
-	if (!nonEmptyString(provider)) return bad("bad_frame", "model.set.model.provider 必须是非空字符串", id);
-	if (!nonEmptyString(api)) return bad("bad_frame", "model.set.model.api 必须是非空字符串", id);
-	if (!nonEmptyString(baseUrl)) return bad("bad_frame", "model.set.model.baseUrl 必须是非空字符串", id);
-	if (!isRecord(model)) return bad("bad_frame", "model.set.model.model 必须是对象", id);
-	if (!nonEmptyString(model["id"])) return bad("bad_frame", "model.set.model.model.id 必须是非空字符串", id);
-	if (!isPositiveInt(model["contextWindow"]))
-		return bad("bad_frame", "model.set.model.model.contextWindow 必须是正整数", id);
-	if (!isPositiveInt(model["maxTokens"])) return bad("bad_frame", "model.set.model.model.maxTokens 必须是正整数", id);
+	if (!nonEmptyString(provider)) return invalid("model.set.model.provider 必须是非空字符串");
+	if (!nonEmptyString(api)) return invalid("model.set.model.api 必须是非空字符串");
+	if (!nonEmptyString(baseUrl)) return invalid("model.set.model.baseUrl 必须是非空字符串");
+	if (!isRecord(model)) return invalid("model.set.model.model 必须是对象");
+	if (!nonEmptyString(model["id"])) return invalid("model.set.model.model.id 必须是非空字符串");
+	if (!isPositiveInt(model["contextWindow"])) return invalid("model.set.model.model.contextWindow 必须是正整数");
+	if (!isPositiveInt(model["maxTokens"])) return invalid("model.set.model.model.maxTokens 必须是正整数");
 
 	const name = model["name"];
-	if (name !== undefined && typeof name !== "string") return bad("bad_frame", "model.set.model.model.name 必须是字符串", id);
+	if (name !== undefined && typeof name !== "string") return invalid("model.set.model.model.name 必须是字符串");
 	const reasoning = model["reasoning"];
 	if (reasoning !== undefined && typeof reasoning !== "boolean")
-		return bad("bad_frame", "model.set.model.model.reasoning 必须是布尔值", id);
+		return invalid("model.set.model.model.reasoning 必须是布尔值");
 
 	const rawInput = model["input"];
 	let input: ("text" | "image")[] | undefined;
 	if (rawInput !== undefined) {
 		if (!Array.isArray(rawInput) || rawInput.some((entry) => entry !== "text" && entry !== "image"))
-			return bad("bad_frame", 'model.set.model.model.input 只能是 "text"/"image" 数组', id);
+			return invalid('model.set.model.model.input 只能是 "text"/"image" 数组');
 		input = rawInput as ("text" | "image")[];
 	}
 
@@ -444,126 +514,102 @@ function parseModelDescriptor(value: unknown, id?: string): { ok: true; model: H
 }
 
 /**
- * 解析一帧入站数据。
+ * 校验请求的方法名与参数。
  *
  * 只做「结构与类型」校验，不做业务校验（例如 provider 是否已配凭证），
  * 业务校验由 session.ts 负责，以便区分 `bad_frame` 与 `bad_request`。
  */
-export function parseHostFrame(line: string): ParseResult {
-	let value: unknown;
-	try {
-		value = JSON.parse(line);
-	} catch {
-		return bad("bad_frame", "帧不是合法 JSON");
-	}
+export function parseAgentRequest(
+	frame: WireRequest,
+): { ok: true; request: AgentRequest } | { ok: false; error: WireError } {
+	const params = frame.params;
+	const id = frame.id;
+	const invalid = (code: ErrorCode, message: string) => ({ ok: false as const, error: { code, message } });
 
-	if (!isRecord(value)) return bad("bad_frame", "帧必须是 JSON 对象");
-
-	const id = extractId(value);
-	const type = value["type"];
-	if (typeof type !== "string") return bad("bad_frame", "帧缺少字符串字段 type", id);
-
-	switch (type) {
-		case "hello": {
-			const versions = value["protocolVersions"];
-			if (!Array.isArray(versions) || versions.some((entry) => !isFiniteNumber(entry) || !Number.isInteger(entry)))
-				return bad("bad_frame", "hello.protocolVersions 必须是整数数组", id);
-			const host = value["host"];
-			if (!isRecord(host) || !nonEmptyString(host["name"]) || !nonEmptyString(host["version"]))
-				return bad("bad_frame", "hello.host 必须含 name/version", id);
+	switch (frame.method) {
+		case AGENT_METHODS.credentialsSet: {
+			if (!isRecord(params)) return invalid("bad_frame", "credentials.set 参数必须是对象");
+			if (!nonEmptyString(params["credentialId"]))
+				return invalid("bad_frame", "credentials.set.credentialId 必须是非空字符串");
+			if (!nonEmptyString(params["provider"])) return invalid("bad_frame", "credentials.set.provider 必须是非空字符串");
+			if (!nonEmptyString(params["apiKey"])) return invalid("bad_frame", "credentials.set.apiKey 必须是非空字符串");
 			return {
 				ok: true,
-				frame: {
-					type: "hello",
-					id: id ?? "",
-					protocolVersions: versions as number[],
-					host: { name: host["name"], version: host["version"] },
-				},
-			};
-		}
-
-		case "credentials.set": {
-			if (id === undefined) return bad("bad_frame", "credentials.set 缺少 id");
-			if (!nonEmptyString(value["credentialId"]))
-				return bad("bad_frame", "credentials.set.credentialId 必须是非空字符串", id);
-			if (!nonEmptyString(value["provider"])) return bad("bad_frame", "credentials.set.provider 必须是非空字符串", id);
-			if (!nonEmptyString(value["apiKey"])) return bad("bad_frame", "credentials.set.apiKey 必须是非空字符串", id);
-			return {
-				ok: true,
-				frame: {
-					type: "credentials.set",
+				request: {
 					id,
-					credentialId: value["credentialId"],
-					provider: value["provider"],
-					apiKey: value["apiKey"],
+					method: AGENT_METHODS.credentialsSet,
+					params: {
+						credentialId: params["credentialId"],
+						provider: params["provider"],
+						apiKey: params["apiKey"],
+					},
 				},
 			};
 		}
 
-		case "credentials.clear": {
-			if (id === undefined) return bad("bad_frame", "credentials.clear 缺少 id");
-			if (!nonEmptyString(value["provider"])) return bad("bad_frame", "credentials.clear.provider 必须是非空字符串", id);
-			return { ok: true, frame: { type: "credentials.clear", id, provider: value["provider"] } };
+		case AGENT_METHODS.credentialsClear: {
+			if (!isRecord(params)) return invalid("bad_frame", "credentials.clear 参数必须是对象");
+			if (!nonEmptyString(params["provider"])) return invalid("bad_frame", "credentials.clear.provider 必须是非空字符串");
+			return { ok: true, request: { id, method: AGENT_METHODS.credentialsClear, params: { provider: params["provider"] } } };
 		}
 
-		case "model.set": {
-			if (id === undefined) return bad("bad_frame", "model.set 缺少 id");
-			const parsed = parseModelDescriptor(value["model"], id);
-			if (!parsed.ok) return parsed;
-			return { ok: true, frame: { type: "model.set", id, model: parsed.model } };
+		case AGENT_METHODS.modelSet: {
+			if (!isRecord(params)) return invalid("bad_frame", "model.set 参数必须是对象");
+			const parsed = parseModelDescriptor(params["model"]);
+			if (!parsed.ok) return { ok: false, error: parsed.error };
+			return { ok: true, request: { id, method: AGENT_METHODS.modelSet, params: { model: parsed.model } } };
 		}
 
-		case "session.load": {
-			if (id === undefined) return bad("bad_frame", "session.load 缺少 id");
-			if (!nonEmptyString(value["sessionId"])) return bad("bad_frame", "session.load.sessionId 必须是非空字符串", id);
-			const rawMessages = value["messages"];
-			if (!Array.isArray(rawMessages)) return bad("bad_frame", "session.load.messages 必须是数组", id);
+		case AGENT_METHODS.sessionLoad: {
+			if (!isRecord(params)) return invalid("bad_frame", "session.load 参数必须是对象");
+			if (!nonEmptyString(params["sessionId"])) return invalid("bad_frame", "session.load.sessionId 必须是非空字符串");
+			const rawMessages = params["messages"];
+			if (!Array.isArray(rawMessages)) return invalid("bad_frame", "session.load.messages 必须是数组");
 			if (rawMessages.length > LIMITS.maxSeedMessages)
-				return bad("bad_request", `session.load.messages 超过 ${LIMITS.maxSeedMessages} 条上限`, id);
+				return invalid("bad_request", `session.load.messages 超过 ${LIMITS.maxSeedMessages} 条上限`);
 
 			const messages: HostSeedMessage[] = [];
 			for (let index = 0; index < rawMessages.length; index++) {
 				const entry = rawMessages[index];
-				if (!isRecord(entry)) return bad("bad_frame", `session.load.messages[${index}] 必须是对象`, id);
+				if (!isRecord(entry)) return invalid("bad_frame", `session.load.messages[${index}] 必须是对象`);
 				const role = entry["role"];
 				if (role !== "user" && role !== "assistant")
-					return bad("bad_frame", `session.load.messages[${index}].role 只能是 user/assistant`, id);
+					return invalid("bad_frame", `session.load.messages[${index}].role 只能是 user/assistant`);
 				if (typeof entry["text"] !== "string")
-					return bad("bad_frame", `session.load.messages[${index}].text 必须是字符串`, id);
+					return invalid("bad_frame", `session.load.messages[${index}].text 必须是字符串`);
 				if (!isFiniteNumber(entry["timestamp"]))
-					return bad("bad_frame", `session.load.messages[${index}].timestamp 必须是数字`, id);
+					return invalid("bad_frame", `session.load.messages[${index}].timestamp 必须是数字`);
 				messages.push({ role, text: entry["text"], timestamp: entry["timestamp"] });
 			}
-			return { ok: true, frame: { type: "session.load", id, sessionId: value["sessionId"], messages } };
+			return {
+				ok: true,
+				request: { id, method: AGENT_METHODS.sessionLoad, params: { sessionId: params["sessionId"], messages } },
+			};
 		}
 
-		case "prompt": {
-			if (id === undefined) return bad("bad_frame", "prompt 缺少 id");
-			if (typeof value["text"] !== "string") return bad("bad_frame", "prompt.text 必须是字符串", id);
-			if (value["text"].trim().length === 0) return bad("bad_request", "prompt.text 不能为空", id);
-			if (value["text"].length > LIMITS.maxPromptChars)
-				return bad("bad_request", `prompt.text 超过 ${LIMITS.maxPromptChars} 字符上限`, id);
-			return { ok: true, frame: { type: "prompt", id, text: value["text"] } };
+		case AGENT_METHODS.prompt: {
+			if (!isRecord(params)) return invalid("bad_frame", "prompt 参数必须是对象");
+			if (typeof params["text"] !== "string") return invalid("bad_frame", "prompt.text 必须是字符串");
+			if (params["text"].trim().length === 0) return invalid("bad_request", "prompt.text 不能为空");
+			if (params["text"].length > LIMITS.maxPromptChars)
+				return invalid("bad_request", `prompt.text 超过 ${LIMITS.maxPromptChars} 字符上限`);
+			return { ok: true, request: { id, method: AGENT_METHODS.prompt, params: { text: params["text"] } } };
 		}
 
-		case "cancel": {
-			if (id === undefined) return bad("bad_frame", "cancel 缺少 id");
-			if (!nonEmptyString(value["targetId"])) return bad("bad_frame", "cancel.targetId 必须是非空字符串", id);
-			return { ok: true, frame: { type: "cancel", id, targetId: value["targetId"] } };
+		case AGENT_METHODS.cancel: {
+			if (!isRecord(params)) return invalid("bad_frame", "cancel 参数必须是对象");
+			if (!nonEmptyString(params["targetId"])) return invalid("bad_frame", "cancel.targetId 必须是非空字符串");
+			return { ok: true, request: { id, method: AGENT_METHODS.cancel, params: { targetId: params["targetId"] } } };
 		}
 
-		case "ping": {
-			if (id === undefined) return bad("bad_frame", "ping 缺少 id");
-			return { ok: true, frame: { type: "ping", id } };
-		}
+		case AGENT_METHODS.ping:
+			return { ok: true, request: { id, method: AGENT_METHODS.ping, params: {} } };
 
-		case "shutdown": {
-			if (id === undefined) return bad("bad_frame", "shutdown 缺少 id");
-			return { ok: true, frame: { type: "shutdown", id } };
-		}
+		case AGENT_METHODS.shutdown:
+			return { ok: true, request: { id, method: AGENT_METHODS.shutdown, params: {} } };
 
 		default:
-			return bad("unknown_type", `未知的帧类型：${type}`, id);
+			return { ok: false, error: { code: "method_not_found", message: `未知方法：${frame.method}` } };
 	}
 }
 
